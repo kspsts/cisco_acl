@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import re, ipaddress, json
+import re, ipaddress, json, sys
 from pathlib import Path
 from html import escape
 from collections import defaultdict
@@ -157,15 +157,22 @@ def parse_config(text: str) -> dict:
     # object-groups (kept simple)
     for m in re.finditer(r"^object-group\s+(network|service)\s+(\S+)(.*?)(?=^object-group|^ip access-list|^interface|^line\s+|\Z)", text, re.S | re.M):
         og_type, og_name, body = m.group(1), m.group(2), m.group(3)
-        body_clean = "\n".join(
-            _strip_inline_comment(ln.rstrip())
-            for ln in body.splitlines()
-            if ln.strip() and not _is_comment_line(ln)
-        )
+        start_line = text.count("\n", 0, m.start()) + 1
         members = []
-        for n in re.finditer(r"^\s*(network-object|host|service-object|group-object|port-object)\s+(.+)$", body_clean, re.M):
-            members.append(n.group(2).strip())
-        cfg["object_groups"][og_name] = {"type": og_type, "members": members}
+        for offset, raw_ln in enumerate(body.splitlines(), 1):
+            cleaned = _strip_inline_comment(raw_ln.rstrip())
+            if not cleaned or _is_comment_line(cleaned):
+                continue
+            mm = re.match(r"^\s*(network-object|host|service-object|group-object|port-object)\s+(.+)$", cleaned)
+            if not mm:
+                continue
+            keyword, value = mm.group(1), mm.group(2).strip()
+            member = {"kind": keyword, "value": value, "lineno": start_line + offset, "raw": cleaned}
+            if keyword == "group-object":
+                ref = value.split()[0]
+                member["ref"] = ref
+            members.append(member)
+        cfg["object_groups"][og_name] = {"type": og_type, "members": members, "lineno": start_line}
 
     # mgmt
     vty = re.search(r"^line vty.*?(?=^line |\Z)", text, re.S | re.M)
@@ -356,6 +363,85 @@ def _password_is_complex(pwd: str) -> bool:
     if re.search(r"[^\w]", pwd):
         classes += 1
     return classes >= 3
+
+
+def _analyze_object_groups(cfg):
+    groups = cfg.get("object_groups", {}) or {}
+    resolved = {}
+    findings = []
+    cycle_cache = set()
+
+    def dfs(name, stack):
+        if name in resolved:
+            return resolved[name]
+        group = groups.get(name)
+        if not group:
+            return set()
+
+        if name in stack:
+            cycle = tuple(stack[stack.index(name):] + [name])
+            if cycle not in cycle_cache:
+                cycle_cache.add(cycle)
+                lineno = group.get("lineno")
+                chain = " → ".join(cycle)
+                findings.append(_finding(
+                    "high", "object_group_cycle", f"object-group {name}",
+                    f"Обнаружена циклическая ссылка object-group: {chain}.", cfg,
+                    lineno=lineno,
+                    rule=f"object-group {group.get('type', 'network')} {name}",
+                    fix="Переработать структуру object-group, исключить рекурсию."
+                ))
+            return set()
+
+        stack.append(name)
+        accum = set()
+        for member in group.get("members", []):
+            kind = member.get("kind")
+            value = member.get("value")
+            lineno = member.get("lineno")
+            if kind == "group-object":
+                ref = member.get("ref")
+                if not ref or ref not in groups:
+                    findings.append(_finding(
+                        "medium", "object_group_missing", f"object-group {name}",
+                        f"Ссылка на отсутствующий object-group '{ref or '?'}'.", cfg,
+                        lineno=lineno,
+                        rule=member.get("raw"),
+                        fix="Создать недостающий object-group или удалить ссылку."
+                    ))
+                    continue
+                if ref in stack:
+                    cycle = tuple(stack[stack.index(ref):] + [ref])
+                    if cycle not in cycle_cache:
+                        cycle_cache.add(cycle)
+                        chain = " → ".join(cycle)
+                        findings.append(_finding(
+                            "high", "object_group_cycle", f"object-group {name}",
+                            f"Обнаружена циклическая ссылка object-group: {chain}.", cfg,
+                            lineno=lineno,
+                            rule=member.get("raw"),
+                            fix="Разорвать цикл, удалив взаимные group-object ссылки."
+                        ))
+                    continue
+                accum.update(dfs(ref, stack))
+            else:
+                accum.add((kind, value))
+        stack.pop()
+        resolved[name] = accum
+        return accum
+
+    for og_name in groups:
+        dfs(og_name, [])
+
+    normalized = {
+        name: [
+            {"kind": kind, "value": value}
+            for kind, value in sorted(items)
+        ]
+        for name, items in resolved.items()
+    }
+
+    return {"findings": findings, "resolved": normalized}
 
 def run_checks(cfg):
     findings = []
@@ -616,6 +702,11 @@ def run_checks(cfg):
             "Отсутствует предупредительный баннер — требование CIS/NIST.", cfg,
             fix="Добавить 'banner login' с согласованным текстом."))
 
+    # ---------- Object-groups ----------
+    og_result = _analyze_object_groups(cfg)
+    findings.extend(og_result["findings"])
+    cfg["_object_groups_resolved"] = og_result["resolved"]
+
     # ---------- NAT ----------
     for nat in cfg.get("nat", []):
         rule, no = nat["rule"], nat["lineno"]
@@ -829,11 +920,43 @@ chk.forEach(c=>c.addEventListener('change', applyFilters));
 def audit_folder(folder: str):
     out = []
     for f in Path(folder).glob("*.txt"):
-        text = f.read_text(encoding="utf-8", errors="ignore")
-        findings, cfg = run_checks(parse_config(text))
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            print(f"[!] Ошибка чтения {f.name}: {exc}", file=sys.stderr)
+            dummy_cfg = {"raw": "", "raw_lines": []}
+            err = _finding(
+                "high", "file_read_error", f.name,
+                f"Не удалось прочитать файл: {exc}", dummy_cfg,
+                fix="Проверить права доступа и целостность файла."
+            )
+            out.append({
+                "file": f.name, "hostname": None,
+                "findings": [err], "_interzone": [], "_object_groups": {}
+            })
+            continue
+
+        try:
+            cfg = parse_config(text)
+            findings, cfg = run_checks(cfg)
+        except Exception as exc:
+            print(f"[!] Ошибка обработки {f.name}: {exc}", file=sys.stderr)
+            dummy_cfg = {"raw": text, "raw_lines": text.splitlines()}
+            err = _finding(
+                "high", "audit_error", f.name,
+                f"Ошибка обработки конфигурации: {exc}", dummy_cfg,
+                fix="Проверить формат конфига или обновить парсер."
+            )
+            out.append({
+                "file": f.name, "hostname": None,
+                "findings": [err], "_interzone": [], "_object_groups": {}
+            })
+            continue
+
         out.append({
             "file": f.name, "hostname": cfg.get("hostname"),
-            "findings": findings, "_interzone": cfg.get("_interzone", [])
+            "findings": findings, "_interzone": cfg.get("_interzone", []),
+            "_object_groups": cfg.get("_object_groups_resolved", {})
         })
     return out
 
