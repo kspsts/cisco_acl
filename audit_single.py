@@ -135,6 +135,7 @@ def parse_config(text: str) -> dict:
             "enable": [],
             "user_passwords": [],
         },
+        "acl_usage": defaultdict(list),
         "raw": text,
         "raw_lines": raw_lines,
     }
@@ -180,6 +181,19 @@ def parse_config(text: str) -> dict:
             "nat_role": nat_role,
             "zone": zone,
         }
+
+        if acl_in:
+            cfg["acl_usage"][acl_in.group(1)].append({
+                "interface": name,
+                "direction": "in",
+                "zone": zone,
+            })
+        if acl_out:
+            cfg["acl_usage"][acl_out.group(1)].append({
+                "interface": name,
+                "direction": "out",
+                "zone": zone,
+            })
 
     # named ACLs with line numbers
     for m in re.finditer(r"^ip access-list (extended|standard)\s+(\S+)", text, re.M):
@@ -387,6 +401,63 @@ def _map_ip_to_zone(ipobj, nets):
                 zones.append(zone)
         except: pass
     return sorted(set(zones))
+
+
+_SEVERITY_ORDER = {"high": 3, "medium": 2, "low": 1, "ok": 0}
+
+
+def _find_acl_interfaces(cfg, acl_name):
+    usage = cfg.get("acl_usage") or {}
+    return list(usage.get(acl_name, []))
+
+
+def _evaluate_any_any_risk(zone, direction):
+    zone = (zone or "?").upper()
+    direction = (direction or "in").lower()
+
+    if zone == "INET":
+        if direction == "in":
+            return "high", "Разрешение ANY из внешней зоны внутрь."
+        return "low", "Исходящий ANY в INET — стандартная политика, требуется контроль только при особых требованиях."
+
+    if zone in ("DMZ", "PARTNER"):
+        if direction == "in":
+            return "high", f"ANY из зоны {zone} внутрь — риск нарушения сегментации."
+        return "medium", f"ANY из {zone} наружу — убедитесь в необходимости."
+
+    if zone in ("WIFI", "GUEST"):
+        if direction == "in":
+            return "high", "Гостевой/WiFi трафик не должен бесконтрольно входить в сеть."
+        return "medium", "Исходящий ANY из WiFi — требуется строгое ограничение."
+
+    if zone == "MGMT":
+        return "high", "ANY на управляющем сегменте — критичный риск."
+
+    if zone == "LAN":
+        if direction == "in":
+            return "medium", "ANY внутри LAN — возможны боковые перемещения."
+        return "medium", "Исходящий ANY из LAN — контроль нужен на границе."
+
+    return "medium", "Широкое правило — уточните бизнес-потребность."
+
+
+def _contextual_any_any(cfg, acl_name):
+    contexts = _find_acl_interfaces(cfg, acl_name)
+    if not contexts:
+        return "low", "ACL не назначен ни на один интерфейс."
+
+    worst = "low"
+    details = []
+    for ctx in contexts:
+        zone = ctx.get("zone") or "?"
+        direction = ctx.get("direction") or "in"
+        iface = ctx.get("interface") or "?"
+        sev, desc = _evaluate_any_any_risk(zone, direction)
+        if _SEVERITY_ORDER[sev] > _SEVERITY_ORDER[worst]:
+            worst = sev
+        details.append(f"{iface} ({direction}, {zone}): {desc}")
+
+    return worst, "; ".join(details)
 
 def _rate_pair(src, dst):
     if src == "INET" and dst in ("LAN","DMZ","MGMT"): return ("high","Внешняя сеть внутрь — запрещать, кроме строго опубликованного.")
@@ -662,21 +733,32 @@ def run_checks(cfg):
         for it in items:
             ln = it["text"]; no = it["lineno"]
             if re.search(r"\bpermit\s+ip\s+any\s+any\b", ln):
-                findings.append(_finding("high","acl_any_any",f"ACL {acl}",
-                    "Широкое разрешение (permit ip any any).",
+                severity, ctx_msg = _contextual_any_any(cfg, acl)
+                message = "Широкое разрешение (permit ip any any)."
+                if ctx_msg:
+                    message += f" {ctx_msg}"
+                findings.append(_finding(severity,"acl_any_any",f"ACL {acl}",
+                    message,
                     cfg, lineno=no, rule=ln,
                     fix="Сузить источники/назначения, разрешать только нужные протоколы/сети; добавить явный deny/log."))
             if re.search(r"\bpermit\s+tcp\s+any\s+any\b", ln):
+                severity, ctx_msg = _contextual_any_any(cfg, acl)
                 if re.search(r"\bestablished\b", ln, re.I):
-                    findings.append(_finding("medium","acl_tcp_any_any_established",f"ACL {acl}",
-                        "TCP any→any с established — допускает широкий возвратный трафик.",
-                        cfg, lineno=no, rule=ln,
-                        fix="Сузить источники/назначения либо использовать stateful-политику с контролем состояний."))
+                    if _SEVERITY_ORDER[severity] > _SEVERITY_ORDER["medium"]:
+                        severity = "medium"
+                    message = "TCP any→any с established — допускает широкий возвратный трафик."
+                    fix_text = "Сузить источники/назначения либо использовать stateful-политику с контролем состояний."
+                    finding_type = "acl_tcp_any_any_established"
                 else:
-                    findings.append(_finding("high","acl_tcp_any_any",f"ACL {acl}",
-                        "Широкий TCP any→any.",
-                        cfg, lineno=no, rule=ln,
-                        fix="Уточнить src/dst и порты; рассмотреть stateful/policy-map в ZBF."))
+                    message = "Широкий TCP any→any."
+                    fix_text = "Уточнить src/dst и порты; рассмотреть stateful/policy-map в ZBF."
+                    finding_type = "acl_tcp_any_any"
+                if ctx_msg:
+                    message += f" {ctx_msg}"
+                findings.append(_finding(severity,finding_type,f"ACL {acl}",
+                    message,
+                    cfg, lineno=no, rule=ln,
+                    fix=fix_text))
             if re.search(r"\b(eq\s+23|eq\s+3389|range\s+1\s+1024)\b", ln):
                 findings.append(_finding("medium","risky_ports",f"ACL {acl}",
                     "Рискованные порты (Telnet/RDP/низкие диапазоны).",
