@@ -172,6 +172,8 @@ def parse_config(text: str) -> dict:
         network = _calc_network(ip) if ip else None
         zone = _infer_zone(desc.group(1).strip() if desc else "", name, nat_role)
 
+        is_tunnel = name.lower().startswith("tunnel") or bool(re.search(r"^\s*tunnel\s+", body_clean, re.M))
+
         cfg["interfaces"][name] = {
             "description": (desc.group(1).strip() if desc else ""),
             "ip": ip,
@@ -180,6 +182,7 @@ def parse_config(text: str) -> dict:
             "acl_out": (acl_out.group(1) if acl_out else None),
             "nat_role": nat_role,
             "zone": zone,
+            "is_tunnel": is_tunnel,
         }
 
         if acl_in:
@@ -781,13 +784,19 @@ def run_checks(cfg):
 
     # ---------- Интерфейсы ----------
     for ifname, idef in cfg.get("interfaces", {}).items():
-        if idef.get("ip") and not idef.get("acl_in") and not idef.get("acl_out"):
+        if not idef.get("ip"):
+            continue
+        has_acl = bool(idef.get("acl_in") or idef.get("acl_out"))
+        if not has_acl:
+            if idef.get("is_tunnel"):
+                continue
             findings.append(_finding("medium","iface_no_acl",f"interface {ifname}",
                 "IP-интерфейс без ip access-group (нет фильтрации).",
                 cfg, fix="Назначить ACL in/out либо использовать Zone-Based Firewall с policy-map."))
-        else:
-            findings.append(_finding("ok","iface_acl_present",f"interface {ifname}",
-                "На интерфейсе назначен ACL (in/out).", cfg))
+            continue
+
+        findings.append(_finding("ok","iface_acl_present",f"interface {ifname}",
+            "На интерфейсе назначен ACL (in/out).", cfg))
 
     # ---------- SNMP / VTY / HTTP ----------
     for item in cfg["mgmt"].get("snmp", []):
