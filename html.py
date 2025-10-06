@@ -4,14 +4,38 @@ from html import escape
 from collections import defaultdict
 
 _PALETTE = {
-    "high":  "#ef4444",  # red-500
-    "medium":"#f59e0b",  # amber-500
-    "low":   "#3b82f6",  # blue-500
-    "ok":    "#10b981",  # emerald-500
+    "high":  "#ef4444",
+    "medium":"#f59e0b",
+    "low":   "#3b82f6",
+    "ok":    "#10b981",
 }
 
 def _badge(sev:str) -> str:
     return f'<span class="badge" style="background:{_PALETTE[sev]}">{sev.upper()}</span>'
+
+def _matrix_table(rows):
+    # Список строк вида: {"src","dst","sev","count","samples","note"}
+    # Собираем уникальные зоны
+    zones = sorted({r["src"] for r in rows} | {r["dst"] for r in rows})
+    cell = {(r["src"], r["dst"]): r for r in rows}
+    html = []
+    html.append("<table><thead><tr><th>Src \\ Dst</th>")
+    for z in zones: html.append(f"<th>{escape(z)}</th>")
+    html.append("</tr></thead><tbody>")
+    for s in zones:
+        html.append(f"<tr><td><b>{escape(s)}</b></td>")
+        for d in zones:
+            r = cell.get((s,d))
+            if not r:
+                html.append("<td class='muted'>—</td>")
+                continue
+            sev = r["sev"]
+            cnt = r["count"]
+            title = escape(r["note"])
+            html.append(f"<td class='sev-{sev}' title='{title}'>{_badge(sev)}&nbsp;{cnt}</td>")
+        html.append("</tr>")
+    html.append("</tbody></table>")
+    return "".join(html)
 
 def render(dev_reports):
     totals = defaultdict(int)
@@ -23,7 +47,7 @@ def render(dev_reports):
     html.append("""<!doctype html><meta charset="utf-8">
 <title>Cisco GW Audit</title>
 <style>
- body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.45}
+ body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.45;background:#f8fafc}
  h1{margin:0 0 12px}
  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin:16px 0}
  .card{border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff;box-shadow:0 1px 2px #0001}
@@ -38,6 +62,7 @@ def render(dev_reports):
  .sev-low{background:#eff6ff}
  .sev-ok{background:#ecfdf5}
  .muted{color:#6b7280}
+ h3{margin:6px 0 10px}
 </style>
 <h1>Отчёт аудита Cisco GW</h1>
 """)
@@ -52,11 +77,17 @@ def render(dev_reports):
     for r in dev_reports:
         host = escape(r.get("hostname") or r.get("file"))
         html.append(f"<div class='card'><h3>{host}</h3>")
+
+        # Матрица межзоновых разрешений
+        iz = r.get("_interzone", [])
+        if iz:
+            html.append("<b>Матрица межзоновых разрешений</b>")
+            html.append(_matrix_table(iz))
+
         # Группировка по severity
         groups = {"high":[], "medium":[], "low":[], "ok":[]}
         for f in r["findings"]:
             groups[f["sev"]].append(f)
-
         for sev in ("high","medium","low","ok"):
             if not groups[sev]: continue
             html.append(f"<details open><summary>{sev.upper()} {_badge(sev)} — {len(groups[sev])}</summary>")
