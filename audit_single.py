@@ -30,6 +30,67 @@ def _strip_inline_comment(line: str) -> str:
 def _is_comment_line(line: str) -> bool:
     return bool(line) and line.lstrip().startswith(("!", "#", "//"))
 
+
+def _parse_object_group_member(keyword: str, value: str) -> dict:
+    tokens = value.split()
+    member = {
+        "keyword": keyword,
+        "value": value,
+        "kind": keyword,
+    }
+
+    if keyword == "group-object":
+        member["kind"] = "group-object"
+        member["ref"] = tokens[0] if tokens else ""
+        return member
+
+    if keyword == "network-object":
+        if not tokens:
+            member["kind"] = "unknown"
+            return member
+        head = tokens[0]
+        if head == "host" and len(tokens) >= 2:
+            member["kind"] = "host"
+            member["address"] = tokens[1]
+            return member
+        if head == "range" and len(tokens) >= 3:
+            member["kind"] = "range"
+            member["start"] = tokens[1]
+            member["end"] = tokens[2]
+            return member
+        if head == "object-group" and len(tokens) >= 2:
+            member["kind"] = "group-object"
+            member["ref"] = tokens[1]
+            return member
+        if len(tokens) >= 2:
+            member["kind"] = "network"
+            member["address"] = tokens[0]
+            member["mask"] = tokens[1]
+            return member
+        member["kind"] = "unknown"
+        return member
+
+    if keyword == "host":
+        if tokens:
+            member["kind"] = "host"
+            member["address"] = tokens[0]
+        else:
+            member["kind"] = "unknown"
+        return member
+
+    if keyword == "service-object":
+        member["kind"] = "service-object"
+        member["parts"] = tokens
+        return member
+
+    if keyword == "port-object":
+        member["kind"] = "port-object"
+        member["parts"] = tokens
+        return member
+
+    member["kind"] = keyword
+    return member
+
 def _infer_zone(desc, ifname, nat_role):
     s = f"{desc or ''} {ifname or ''}".lower()
     for z, keys in _ZONE_KEYWORDS.items():
@@ -167,10 +228,8 @@ def parse_config(text: str) -> dict:
             if not mm:
                 continue
             keyword, value = mm.group(1), mm.group(2).strip()
-            member = {"kind": keyword, "value": value, "lineno": start_line + offset, "raw": cleaned}
-            if keyword == "group-object":
-                ref = value.split()[0]
-                member["ref"] = ref
+            member = _parse_object_group_member(keyword, value)
+            member.update({"lineno": start_line + offset, "raw": cleaned})
             members.append(member)
         cfg["object_groups"][og_name] = {"type": og_type, "members": members, "lineno": start_line}
 
@@ -291,10 +350,33 @@ def _collect_if_networks(cfg):
         nets.append((ifn, zone, ipaddress.IPv4Network(net)))
     return nets
 
-def _ip_tokens(s):
+def _ip_tokens(s, cfg):
+    seen = set()
+
     for m in _IP_RE.finditer(s):
         tok = m.group(0)
-        yield (ipaddress.IPv4Network(tok, strict=False) if "/" in tok else ipaddress.IPv4Address(tok))
+        try:
+            obj = ipaddress.IPv4Network(tok, strict=False) if "/" in tok else ipaddress.IPv4Address(tok)
+        except Exception:
+            continue
+        if obj in seen:
+            continue
+        seen.add(obj)
+        yield obj
+
+    og_networks = cfg.get("_og_networks", {}) or {}
+    for m in re.finditer(r"object-group\s+(\S+)", s):
+        name = m.group(1)
+        entries = og_networks.get(name)
+        if not entries:
+            continue
+        for etype, payload in entries:
+            if etype != "network":
+                continue
+            if payload in seen:
+                continue
+            seen.add(payload)
+            yield payload
 
 def _map_ip_to_zone(ipobj, nets):
     zones = []
@@ -367,81 +449,207 @@ def _password_is_complex(pwd: str) -> bool:
 
 def _analyze_object_groups(cfg):
     groups = cfg.get("object_groups", {}) or {}
-    resolved = {}
     findings = []
     cycle_cache = set()
+    resolved_networks = {}
+    resolved_services = {}
 
-    def dfs(name, stack):
-        if name in resolved:
-            return resolved[name]
+    def _register_cycle(stack, name, lineno, raw_rule, group_type):
+        cycle = tuple(stack[stack.index(name):] + [name])
+        key = (group_type, cycle)
+        if key in cycle_cache:
+            return
+        cycle_cache.add(key)
+        chain = " → ".join(cycle)
+        findings.append(_finding(
+            "high", "object_group_cycle", f"object-group {name}",
+            f"Обнаружена циклическая ссылка object-group: {chain}.", cfg,
+            lineno=lineno,
+            rule=raw_rule or f"object-group {group_type} {name}",
+            fix="Переработать структуру object-group, исключить рекурсию."
+        ))
+
+    def resolve(name, stack):
+        if name in resolved_networks:
+            return ("network", resolved_networks[name])
+        if name in resolved_services:
+            return ("service", resolved_services[name])
+
         group = groups.get(name)
         if not group:
-            return set()
+            return (None, set())
 
+        group_type = group.get("type")
         if name in stack:
-            cycle = tuple(stack[stack.index(name):] + [name])
-            if cycle not in cycle_cache:
-                cycle_cache.add(cycle)
-                lineno = group.get("lineno")
-                chain = " → ".join(cycle)
-                findings.append(_finding(
-                    "high", "object_group_cycle", f"object-group {name}",
-                    f"Обнаружена циклическая ссылка object-group: {chain}.", cfg,
-                    lineno=lineno,
-                    rule=f"object-group {group.get('type', 'network')} {name}",
-                    fix="Переработать структуру object-group, исключить рекурсию."
-                ))
-            return set()
+            _register_cycle(stack, name, group.get("lineno"), None, group_type)
+            return (group_type, set())
 
         stack.append(name)
-        accum = set()
+
+        if group_type == "network":
+            container = set()
+            for member in group.get("members", []):
+                kind = member.get("kind")
+                lineno = member.get("lineno")
+                raw = member.get("raw")
+
+                if kind == "group-object":
+                    ref = member.get("ref")
+                    if not ref or ref not in groups:
+                        findings.append(_finding(
+                            "medium", "object_group_missing", f"object-group {name}",
+                            f"Ссылка на отсутствующий object-group '{ref or '?'}'.", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Создать недостающий object-group или удалить ссылку."
+                        ))
+                        continue
+                    ref_type = groups[ref].get("type")
+                    if ref_type != "network":
+                        findings.append(_finding(
+                            "medium", "object_group_type_mismatch", f"object-group {name}",
+                            f"Ссылка на object-group '{ref}' другого типа ({ref_type}).", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Использовать внутри network-group только network-object."
+                        ))
+                        continue
+                    if ref in stack:
+                        _register_cycle(stack, ref, lineno, raw, group_type)
+                        continue
+                    _, resolved_set = resolve(ref, stack)
+                    container.update(resolved_set)
+                    continue
+
+                if kind == "host":
+                    addr = member.get("address")
+                    try:
+                        ip = ipaddress.IPv4Address(addr)
+                        container.add(("network", ipaddress.IPv4Network(f"{ip}/32")))
+                    except Exception:
+                        findings.append(_finding(
+                            "medium", "object_group_invalid_ip", f"object-group {name}",
+                            f"Некорректный host-адрес '{addr}'.", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Исправить адрес или удалить запись."
+                        ))
+                    continue
+
+                if kind == "network":
+                    addr = member.get("address")
+                    mask = member.get("mask")
+                    prefix = _mask_to_prefix(mask)
+                    if prefix is None:
+                        findings.append(_finding(
+                            "medium", "object_group_invalid_mask", f"object-group {name}",
+                            f"Некорректная маска '{mask}'.", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Задать корректную маску или префикс."
+                        ))
+                        continue
+                    try:
+                        net = ipaddress.IPv4Network(f"{addr}/{prefix}", strict=False)
+                        container.add(("network", net))
+                    except Exception:
+                        findings.append(_finding(
+                            "medium", "object_group_invalid_ip", f"object-group {name}",
+                            f"Некорректная сеть '{addr} {mask}'.", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Проверить IP-адрес и маску."
+                        ))
+                    continue
+
+                if kind == "range":
+                    start, end = member.get("start"), member.get("end")
+                    try:
+                        ipaddress.IPv4Address(start)
+                        ipaddress.IPv4Address(end)
+                        container.add(("range", (start, end)))
+                        findings.append(_finding(
+                            "low", "object_group_range", f"object-group {name}",
+                            f"Диапазон {start}-{end} не может быть точно сопоставлен зонам.", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Рассмотреть замену на сети/host для корректного анализа."
+                        ))
+                    except Exception:
+                        findings.append(_finding(
+                            "medium", "object_group_invalid_range", f"object-group {name}",
+                            f"Некорректный диапазон '{start} {end}'.", cfg,
+                            lineno=lineno, rule=raw,
+                            fix="Исправить диапазон."
+                        ))
+                    continue
+
+                findings.append(_finding(
+                    "low", "object_group_unknown_member", f"object-group {name}",
+                    f"Неизвестный тип записи '{member.get('keyword')}'.", cfg,
+                    lineno=lineno, rule=raw,
+                    fix="Проверить синтаксис object-group."
+                ))
+
+            stack.pop()
+            resolved_networks[name] = container
+            return ("network", container)
+
+        container = set()
         for member in group.get("members", []):
             kind = member.get("kind")
-            value = member.get("value")
             lineno = member.get("lineno")
+            raw = member.get("raw")
             if kind == "group-object":
                 ref = member.get("ref")
                 if not ref or ref not in groups:
                     findings.append(_finding(
                         "medium", "object_group_missing", f"object-group {name}",
                         f"Ссылка на отсутствующий object-group '{ref or '?'}'.", cfg,
-                        lineno=lineno,
-                        rule=member.get("raw"),
+                        lineno=lineno, rule=raw,
                         fix="Создать недостающий object-group или удалить ссылку."
                     ))
                     continue
-                if ref in stack:
-                    cycle = tuple(stack[stack.index(ref):] + [ref])
-                    if cycle not in cycle_cache:
-                        cycle_cache.add(cycle)
-                        chain = " → ".join(cycle)
-                        findings.append(_finding(
-                            "high", "object_group_cycle", f"object-group {name}",
-                            f"Обнаружена циклическая ссылка object-group: {chain}.", cfg,
-                            lineno=lineno,
-                            rule=member.get("raw"),
-                            fix="Разорвать цикл, удалив взаимные group-object ссылки."
-                        ))
+                ref_type = groups[ref].get("type")
+                if ref_type != group_type:
+                    findings.append(_finding(
+                        "medium", "object_group_type_mismatch", f"object-group {name}",
+                        f"Ссылка на object-group '{ref}' другого типа ({ref_type}).", cfg,
+                        lineno=lineno, rule=raw,
+                        fix="Привести типы object-group к одному виду."
+                    ))
                     continue
-                accum.update(dfs(ref, stack))
-            else:
-                accum.add((kind, value))
+                if ref in stack:
+                    _register_cycle(stack, ref, lineno, raw, group_type)
+                    continue
+                _, resolved_set = resolve(ref, stack)
+                container.update(resolved_set)
+                continue
+            container.add(raw)
+
         stack.pop()
-        resolved[name] = accum
-        return accum
+        resolved_services[name] = container
+        return ("service", container)
 
     for og_name in groups:
-        dfs(og_name, [])
+        resolve(og_name, [])
 
-    normalized = {
-        name: [
-            {"kind": kind, "value": value}
-            for kind, value in sorted(items)
-        ]
-        for name, items in resolved.items()
+    def _format_network_entry(entry):
+        etype, payload = entry
+        if etype == "network":
+            return str(payload)
+        if etype == "range":
+            start, end = payload
+            return f"range {start} {end}"
+        return str(payload)
+
+    json_ready = {
+        "network": {name: sorted(_format_network_entry(e) for e in values)
+                     for name, values in resolved_networks.items()},
+        "service": {name: sorted(values)
+                     for name, values in resolved_services.items()},
     }
 
-    return {"findings": findings, "resolved": normalized}
+    return {
+        "findings": findings,
+        "resolved_networks": resolved_networks,
+        "resolved_services": resolved_services,
+        "json_ready": json_ready,
+    }
 
 def run_checks(cfg):
     findings = []
@@ -459,10 +667,16 @@ def run_checks(cfg):
                     cfg, lineno=no, rule=ln,
                     fix="Сузить источники/назначения, разрешать только нужные протоколы/сети; добавить явный deny/log."))
             if re.search(r"\bpermit\s+tcp\s+any\s+any\b", ln):
-                findings.append(_finding("high","acl_tcp_any_any",f"ACL {acl}",
-                    "Широкий TCP any→any.",
-                    cfg, lineno=no, rule=ln,
-                    fix="Уточнить src/dst и порты; рассмотреть stateful/policy-map в ZBF."))
+                if re.search(r"\bestablished\b", ln, re.I):
+                    findings.append(_finding("medium","acl_tcp_any_any_established",f"ACL {acl}",
+                        "TCP any→any с established — допускает широкий возвратный трафик.",
+                        cfg, lineno=no, rule=ln,
+                        fix="Сузить источники/назначения либо использовать stateful-политику с контролем состояний."))
+                else:
+                    findings.append(_finding("high","acl_tcp_any_any",f"ACL {acl}",
+                        "Широкий TCP any→any.",
+                        cfg, lineno=no, rule=ln,
+                        fix="Уточнить src/dst и порты; рассмотреть stateful/policy-map в ZBF."))
             if re.search(r"\b(eq\s+23|eq\s+3389|range\s+1\s+1024)\b", ln):
                 findings.append(_finding("medium","risky_ports",f"ACL {acl}",
                     "Рискованные порты (Telnet/RDP/низкие диапазоны).",
@@ -705,7 +919,8 @@ def run_checks(cfg):
     # ---------- Object-groups ----------
     og_result = _analyze_object_groups(cfg)
     findings.extend(og_result["findings"])
-    cfg["_object_groups_resolved"] = og_result["resolved"]
+    cfg["_object_groups_resolved"] = og_result["json_ready"]
+    cfg["_og_networks"] = og_result["resolved_networks"]
 
     # ---------- NAT ----------
     for nat in cfg.get("nat", []):
@@ -731,7 +946,7 @@ def run_checks(cfg):
             ln, no = it["text"], it["lineno"]
             if "permit" not in ln: continue
             dst_zones = set()
-            for ipobj in _ip_tokens(ln):
+            for ipobj in _ip_tokens(ln, cfg):
                 for z in _map_ip_to_zone(ipobj, nets):
                     dst_zones.add(z)
             for dst_zone in sorted(dst_zones):
