@@ -82,7 +82,7 @@ def parse_config(text: str) -> dict:
     if m: cfg["hostname"] = m.group(1)
 
     # interface blocks with indices
-    for m in re.finditer(r"(?m)^interface\s+(\S+)\s*"):
+    for m in re.finditer(r"(?m)^interface\s+(\S+)\s*", text):
         name = m.group(1)
         start = m.start()
         # find next block start or EOF
