@@ -17,6 +17,19 @@ _ZONE_KEYWORDS = {
     "MGMT":["mgmt","oob","management","admin"],
 }
 
+_LINE_COMMENT_RE = re.compile(r"\s+(?:!|//|#).*$")
+
+
+def _strip_inline_comment(line: str) -> str:
+    """Удаляет хвостовые комментарии Cisco/IOS без затрагивания ключевых слов."""
+    if not line:
+        return line
+    return _LINE_COMMENT_RE.sub("", line).rstrip()
+
+
+def _is_comment_line(line: str) -> bool:
+    return bool(line) and line.lstrip().startswith(("!", "#", "//"))
+
 def _infer_zone(desc, ifname, nat_role):
     s = f"{desc or ''} {ifname or ''}".lower()
     for z, keys in _ZONE_KEYWORDS.items():
@@ -55,6 +68,12 @@ def parse_config(text: str) -> dict:
         "nat": [],
         "object_groups": {},
         "mgmt": {"vty": [], "snmp": [], "http": []},
+        "security": {
+            "service_password_encryption": False,
+            "service_password_encryption_lineno": None,
+            "enable": [],
+            "user_passwords": [],
+        },
         "raw": text,
         "raw_lines": raw_lines,
     }
@@ -67,16 +86,25 @@ def parse_config(text: str) -> dict:
         name = m.group(1)
         start = m.start()
         # find next block start or EOF
-        next_m = re.search(r"(?m)^interface\s+\S+", text[m.end():])
-        end_pos = m.end()+next_m.start() if next_m else len(text)
+        rest = text[m.end():]
+        next_m = re.search(r"(?m)^(interface\s+\S+|ip access-list\s+\S+|object-group\s+\S+|line\s+\S+|router\s+\S+|hostname\s+\S+|!)", rest)
+        end_pos = m.end() + next_m.start() if next_m else len(text)
         body = text[m.end():end_pos]
+        body_lines = []
+        for raw_ln in body.splitlines():
+            if _is_comment_line(raw_ln):
+                continue
+            cleaned = _strip_inline_comment(raw_ln.rstrip())
+            if cleaned:
+                body_lines.append(cleaned)
+        body_clean = "\n".join(body_lines)
 
-        desc = re.search(r"^\s*description\s+(.+)$", body, re.M)
-        ipm  = re.search(r"^\s*ip address\s+([\d\.]+)\s+([\d\.]+)", body, re.M)
-        acl_in  = re.search(r"ip access-group\s+(\S+)\s+in", body)
-        acl_out = re.search(r"ip access-group\s+(\S+)\s+out", body)
-        nat_in  = bool(re.search(r"^\s*ip nat inside\b", body, re.M))
-        nat_out = bool(re.search(r"^\s*ip nat outside\b", body, re.M))
+        desc = re.search(r"^\s*description\s+(.+)$", body_clean, re.M)
+        ipm  = re.search(r"^\s*ip address\s+([\d\.]+)\s+([\d\.]+)", body_clean, re.M)
+        acl_in  = re.search(r"ip access-group\s+(\S+)\s+in", body_clean)
+        acl_out = re.search(r"ip access-group\s+(\S+)\s+out", body_clean)
+        nat_in  = bool(re.search(r"^\s*ip nat inside\b", body_clean, re.M))
+        nat_out = bool(re.search(r"^\s*ip nat outside\b", body_clean, re.M))
         nat_role = "inside" if nat_in else ("outside" if nat_out else None)
         ip = f"{ipm.group(1)}/{ipm.group(2)}" if ipm else None
         network = _calc_network(ip) if ip else None
@@ -102,26 +130,40 @@ def parse_config(text: str) -> dict:
         block = text[m.end():end_idx].splitlines()
         cfg["acl_blocks"][name] = {"start": start_line, "end": start_line + len(block)}
         for i, ln in enumerate(block, 1):
-            ln = ln.rstrip()
-            if not ln.strip(): continue
+            ln = _strip_inline_comment(ln.rstrip())
+            if not ln.strip() or _is_comment_line(ln):
+                continue
+            if re.match(r"^\s*remark\b", ln, re.I):
+                continue
             cfg["acls"].setdefault(name, []).append({"text": ln.strip(), "lineno": start_line + i})
 
     # numbered ACLs (single lines)
     for m in re.finditer(r"^access-list\s+(\d+)\s+(.*)$", text, re.M):
         num = m.group(1)
         lineno = text.count("\n", 0, m.start()) + 1
-        cfg["acls"].setdefault(num, []).append({"text": m.group(2).strip(), "lineno": lineno})
+        line = _strip_inline_comment(m.group(2).strip())
+        if not line or re.match(r"^remark\b", line, re.I):
+            continue
+        cfg["acls"].setdefault(num, []).append({"text": line, "lineno": lineno})
 
     # NAT rules
     for m in re.finditer(r"^ip nat (inside|outside)\s+source\s+(.*?)$", text, re.M):
         lineno = text.count("\n", 0, m.start()) + 1
-        cfg["nat"].append({"dir": m.group(1), "rule": m.group(2), "lineno": lineno})
+        rule = _strip_inline_comment(m.group(2).strip())
+        if not rule:
+            continue
+        cfg["nat"].append({"dir": m.group(1), "rule": rule, "lineno": lineno})
 
     # object-groups (kept simple)
-    for m in re.finditer(r"^object-group\s+(network|service)\s+(\S+)(.*?)(?=^object-group|^ip access-list|^interface|\Z)", text, re.S | re.M):
+    for m in re.finditer(r"^object-group\s+(network|service)\s+(\S+)(.*?)(?=^object-group|^ip access-list|^interface|^line\s+|\Z)", text, re.S | re.M):
         og_type, og_name, body = m.group(1), m.group(2), m.group(3)
+        body_clean = "\n".join(
+            _strip_inline_comment(ln.rstrip())
+            for ln in body.splitlines()
+            if ln.strip() and not _is_comment_line(ln)
+        )
         members = []
-        for n in re.finditer(r"^\s*(network-object|host|service-object)\s+(.+)$", body, re.M):
+        for n in re.finditer(r"^\s*(network-object|host|service-object|group-object|port-object)\s+(.+)$", body_clean, re.M):
             members.append(n.group(2).strip())
         cfg["object_groups"][og_name] = {"type": og_type, "members": members}
 
@@ -130,14 +172,93 @@ def parse_config(text: str) -> dict:
     if vty:
         vty_block = vty.group(0)
         first_line = text.count("\n", 0, vty.start()) + 1
-        cfg["mgmt"]["vty"] = [{"text": ln.rstrip(), "lineno": first_line + i}
-                              for i, ln in enumerate(vty_block.splitlines())]
-    cfg["mgmt"]["snmp"] = [{"text": m.group(0), "lineno": text.count('\n', 0, m.start()) + 1,
-                             "community": m.group(1)}
-                           for m in re.finditer(r"^snmp-server community\s+(\S+).*?$", text, re.M)]
-    cfg["mgmt"]["http"] = [{"text": m.group(0), "lineno": text.count('\n', 0, m.start()) + 1,
-                             "kind": m.group(1)}
-                           for m in re.finditer(r"^ip http (server|secure-server).*?$", text, re.M)]
+        vty_lines = []
+        for i, ln in enumerate(vty_block.splitlines()):
+            clean = _strip_inline_comment(ln.rstrip())
+            if not clean or _is_comment_line(clean):
+                continue
+            vty_lines.append({"text": clean, "lineno": first_line + i})
+        cfg["mgmt"]["vty"] = vty_lines
+
+    cfg["mgmt"]["snmp"] = [
+        {"text": _strip_inline_comment(m.group(0)).strip(),
+         "lineno": text.count('\n', 0, m.start()) + 1,
+         "community": m.group(1)}
+        for m in re.finditer(r"^snmp-server community\s+(\S+).*?$", text, re.M)
+    ]
+    cfg["mgmt"]["http"] = [
+        {"text": _strip_inline_comment(m.group(0)).strip(),
+         "lineno": text.count('\n', 0, m.start()) + 1,
+         "kind": m.group(1)}
+        for m in re.finditer(r"^ip http (server|secure-server).*?$", text, re.M)
+    ]
+    # security / auth settings
+    spe = re.search(r"(?m)^service password-encryption\b", text)
+    if spe:
+        cfg["security"]["service_password_encryption"] = True
+        cfg["security"]["service_password_encryption_lineno"] = text.count('\n', 0, spe.start()) + 1
+
+    for m in re.finditer(r"(?m)^enable secret\s+(.+)$", text):
+        raw_line = _strip_inline_comment(m.group(0)).strip()
+        tokens = raw_line.split()
+        if len(tokens) < 3:
+            continue
+        entry = {"kind": "secret", "lineno": text.count('\n', 0, m.start()) + 1, "raw": raw_line}
+        level_offset = 2
+        if len(tokens) > 3 and tokens[2] == "level" and tokens[3].isdigit():
+            entry["level"] = tokens[3]
+            level_offset = 4
+        dtype = "0"
+        val_tokens = tokens[level_offset:]
+        if val_tokens:
+            if val_tokens[0].isdigit():
+                dtype = val_tokens[0]
+                val_tokens = val_tokens[1:]
+        entry["type"] = dtype
+        entry["value"] = " ".join(val_tokens)
+        cfg["security"]["enable"].append(entry)
+
+    for m in re.finditer(r"(?m)^enable password\s+(.+)$", text):
+        raw_line = _strip_inline_comment(m.group(0)).strip()
+        tokens = raw_line.split()
+        if len(tokens) < 3:
+            continue
+        entry = {
+            "kind": "password",
+            "lineno": text.count('\n', 0, m.start()) + 1,
+            "type": tokens[2] if tokens[2].isdigit() else "0",
+            "value": " ".join(tokens[3:]) if tokens[2].isdigit() else " ".join(tokens[2:]),
+            "raw": raw_line,
+        }
+        cfg["security"]["enable"].append(entry)
+
+    for m in re.finditer(r"(?m)^username\s+([^\s]+)\s+.*$", text):
+        raw_line = _strip_inline_comment(m.group(0)).strip()
+        tokens = raw_line.split()
+        if len(tokens) < 3:
+            continue
+        username = tokens[1]
+        record = {"user": username, "lineno": text.count('\n', 0, m.start()) + 1, "raw": raw_line}
+        if "secret" in tokens[2:]:
+            idx = tokens.index("secret", 2)
+            tp = tokens[idx + 1] if idx + 1 < len(tokens) else "0"
+            val_tokens = tokens[idx + 2:]
+            if not tp.isdigit():
+                val_tokens = tokens[idx + 1:]
+                tp = "0"
+            record.update({"kind": "secret", "type": tp, "value": " ".join(val_tokens)})
+        elif "password" in tokens[2:]:
+            idx = tokens.index("password", 2)
+            tp = tokens[idx + 1] if idx + 1 < len(tokens) else "0"
+            val_tokens = tokens[idx + 2:]
+            if not tp.isdigit():
+                val_tokens = tokens[idx + 1:]
+                tp = "0"
+            record.update({"kind": "password", "type": tp, "value": " ".join(val_tokens)})
+        else:
+            continue
+        cfg["security"]["user_passwords"].append(record)
+
     return cfg
 
 # ====================== CHECKS ======================
@@ -200,6 +321,41 @@ def _finding(sev, ftype, where, msg, cfg, lineno=None, rule=None, fix=None):
         "rule": rule, "fix": fix,
         "lineno": lineno, "snippet": snippet, "snippet_start": start
     }
+
+
+def _first_lineno(text: str, pattern: str):
+    m = re.search(pattern, text, re.M)
+    if not m:
+        return None
+    return text.count('\n', 0, m.start()) + 1
+
+
+_STRONG_SECRET_TYPES = {"8", "9"}
+_LEGACY_SECRET_TYPES = {"5"}
+
+
+def _secret_strength(dtype: str) -> str:
+    dtype = (dtype or "0").strip()
+    if dtype in _STRONG_SECRET_TYPES:
+        return "strong"
+    if dtype in _LEGACY_SECRET_TYPES:
+        return "legacy"
+    return "weak"
+
+
+def _password_is_complex(pwd: str) -> bool:
+    if not pwd or len(pwd) < 12:
+        return False
+    classes = 0
+    if re.search(r"[a-z]", pwd):
+        classes += 1
+    if re.search(r"[A-Z]", pwd):
+        classes += 1
+    if re.search(r"\d", pwd):
+        classes += 1
+    if re.search(r"[^\w]", pwd):
+        classes += 1
+    return classes >= 3
 
 def run_checks(cfg):
     findings = []
@@ -286,6 +442,179 @@ def run_checks(cfg):
     if not cfg["mgmt"].get("http"):
         findings.append(_finding("ok","http_disabled","ip http",
             "HTTP/HTTPS управление отключено — ок.", cfg))
+
+    # ---------- Пароли / аутентификация ----------
+    sec = cfg.get("security", {})
+    enable_entries = sec.get("enable", [])
+    enable_secrets = [e for e in enable_entries if e.get("kind") == "secret"]
+    enable_passwords = [e for e in enable_entries if e.get("kind") == "password"]
+
+    if not enable_secrets:
+        findings.append(_finding("high","enable_secret_missing","global",
+            "Не задан 'enable secret' — повышенный риск компрометации привилегий.", cfg,
+            fix="Выполнить 'enable secret 9 <сложный пароль>' и удалить 'enable password'."))
+
+    strong_secret_reported = False
+    for entry in enable_secrets:
+        strength = _secret_strength(entry.get("type"))
+        if strength == "strong":
+            if not strong_secret_reported:
+                findings.append(_finding("ok","enable_secret_strong","enable secret",
+                    "Используется современный алгоритм (type 8/9) для enable secret.", cfg,
+                    lineno=entry.get("lineno"), rule=entry.get("raw")))
+                strong_secret_reported = True
+        elif strength == "legacy":
+            findings.append(_finding("medium","enable_secret_md5","enable secret",
+                "Enable secret type 5 (MD5) считается устаревшим.", cfg,
+                lineno=entry.get("lineno"), rule=entry.get("raw"),
+                fix="Пересоздать enable secret c алгоритмом 9 (scrypt) или 8."))
+        else:
+            severity = "high"
+            msg = "Enable secret хранится в открытом виде/типе слабоой защиты."
+            if (entry.get("type") or "0") == "0" and not _password_is_complex(entry.get("value", "")):
+                msg += " Пароль не соответствует требованиям длины/сложности."
+            findings.append(_finding(severity,"enable_secret_plain","enable secret",
+                f"{msg} (type {entry.get('type') or '0'}).", cfg,
+                lineno=entry.get("lineno"), rule=entry.get("raw"),
+                fix="Удалить строку и задать 'enable secret 9 <сложный пароль>'."))
+
+    for entry in enable_passwords:
+        dtype = entry.get("type") or "0"
+        sev = "high" if dtype == "0" else "medium"
+        msg = "Enable password хранится в открытом виде." if dtype == "0" else "Enable password использует слабую обратимую маскировку."
+        findings.append(_finding(sev,"enable_password_present","enable password",
+            msg, cfg, lineno=entry.get("lineno"), rule=entry.get("raw"),
+            fix="Удалить 'enable password' и использовать только 'enable secret 9'."))
+
+    for record in sec.get("user_passwords", []):
+        dtype = (record.get("type") or "0").strip()
+        kind = record.get("kind")
+        where = f"username {record.get('user')}"
+        raw = record.get("raw")
+        lineno = record.get("lineno")
+        if kind == "password":
+            if dtype == "0":
+                msg = "Пароль пользователя хранится в открытом виде (type 0)."
+                if not _password_is_complex(record.get("value", "")):
+                    msg += " Требования по длине ≥12 и разнообразию символов не выполняются."
+                findings.append(_finding("high","username_plain_password", where,
+                    msg, cfg, lineno=lineno, rule=raw,
+                    fix="Задать 'username <user> secret 9 <сложный пароль>' и включить service password-encryption."))
+            elif dtype == "7":
+                findings.append(_finding("medium","username_type7_password", where,
+                    "Используется type 7 — легко обратимый шифр.", cfg,
+                    lineno=lineno, rule=raw,
+                    fix="Переопределить учётную запись с 'secret 9'."))
+            else:
+                findings.append(_finding("medium","username_masked_password", where,
+                    f"Используется нестандартный тип пароля {dtype}. Проверьте необходимость.", cfg,
+                    lineno=lineno, rule=raw,
+                    fix="Перевыпустить пароль с типом 9."))
+        elif kind == "secret":
+            strength = _secret_strength(dtype)
+            if strength == "strong":
+                findings.append(_finding("ok","username_strong_secret", where,
+                    "Учетная запись использует современный алгоритм (type 8/9).", cfg,
+                    lineno=lineno, rule=raw))
+            elif strength == "legacy":
+                findings.append(_finding("low","username_md5_secret", where,
+                    "Секрет type 5 (MD5) устарел.", cfg,
+                    lineno=lineno, rule=raw,
+                    fix="Перевыпустить секрет type 9."))
+            else:
+                findings.append(_finding("high","username_weak_secret", where,
+                    f"Секрет использует слабый тип {dtype}.", cfg,
+                    lineno=lineno, rule=raw,
+                    fix="Пересоздать с type 9 и сложным паролем."))
+
+    if sec.get("service_password_encryption"):
+        findings.append(_finding("ok","service_password_encryption_enabled","global",
+            "Включено service password-encryption.", cfg,
+            lineno=sec.get("service_password_encryption_lineno")))
+    else:
+        findings.append(_finding("medium","service_password_encryption_disabled","global",
+            "Отключено service password-encryption — пароли выводятся в открытом виде.", cfg,
+            fix="Выполнить 'service password-encryption' или перевести учётки на type 9."))
+
+    # ---------- CIS базовые проверки ----------
+    raw_text = cfg.get("raw", "")
+
+    aaa_lineno = _first_lineno(raw_text, r"(?m)^aaa new-model\b")
+    if aaa_lineno:
+        findings.append(_finding("ok","aaa_new_model","aaa",
+            "Включён aaa new-model.", cfg, lineno=aaa_lineno,
+            rule=cfg["raw_lines"][aaa_lineno-1].strip()))
+    else:
+        findings.append(_finding("high","aaa_new_model_missing","aaa",
+            "Команда 'aaa new-model' отсутствует — не выполнены требования CIS 1.1.", cfg,
+            fix="Активировать AAA и настроить источники аутентификации (local/RADIUS/TACACS+)."))
+
+    login_block = re.search(r"(?m)^login block-for\s+\d+\s+attempts\s+\d+\s+within\s+\d+", raw_text)
+    if login_block:
+        lb_lineno = _first_lineno(raw_text, r"(?m)^login block-for\s+\d+\s+attempts\s+\d+\s+within\s+\d+")
+        findings.append(_finding("ok","login_block_for","security",
+            "Настроена защита от перебора (login block-for).", cfg,
+            lineno=lb_lineno, rule=cfg["raw_lines"][lb_lineno-1].strip()))
+    else:
+        findings.append(_finding("medium","login_block_for_missing","security",
+            "Не настроен login block-for — возможен перебор паролей.", cfg,
+            fix="Добавить 'login block-for <секунды> attempts <N> within <секунды>'."))
+
+    logging_lineno = _first_lineno(raw_text, r"(?m)^logging buffered\b")
+    if logging_lineno:
+        findings.append(_finding("ok","logging_buffered","logging",
+            "Локальное буферизированное логирование включено.", cfg,
+            lineno=logging_lineno, rule=cfg["raw_lines"][logging_lineno-1].strip()))
+    else:
+        findings.append(_finding("medium","logging_buffered_missing","logging",
+            "Не настроено logging buffered — сложнее проводить расследования.", cfg,
+            fix="Добавить 'logging buffered <размер>' и пересмотреть удалённые получатели."))
+
+    ssh_v2_lineno = _first_lineno(raw_text, r"(?m)^ip ssh version 2\b")
+    if ssh_v2_lineno:
+        findings.append(_finding("ok","ssh_version2","ssh",
+            "SSH версии 2 включён.", cfg,
+            lineno=ssh_v2_lineno, rule=cfg["raw_lines"][ssh_v2_lineno-1].strip()))
+    elif re.search(r"(?m)^ip ssh version 1\b", raw_text):
+        findings.append(_finding("high","ssh_version1","ssh",
+            "Установлена устаревшая версия SSHv1.", cfg,
+            fix="Указать 'ip ssh version 2'."))
+    else:
+        findings.append(_finding("medium","ssh_version_unspecified","ssh",
+            "Версия SSH не зафиксирована — требуется явно указать версию 2.", cfg,
+            fix="Добавить 'ip ssh version 2' и ограничить алгоритмы шифрования."))
+
+    exec_timeout_set = any("exec-timeout" in (item.get("text") or "") for item in cfg["mgmt"].get("vty", []))
+    if exec_timeout_set:
+        line = next((item for item in cfg["mgmt"]["vty"] if "exec-timeout" in item.get("text", "")), None)
+        findings.append(_finding("ok","vty_exec_timeout","line vty",
+            "Настроен тайм-аут неактивности VTY.", cfg,
+            lineno=line.get("lineno") if line else None,
+            rule=line.get("text") if line else None))
+    else:
+        findings.append(_finding("medium","vty_exec_timeout_missing","line vty",
+            "Не задан exec-timeout на VTY — сессии остаются бесконечно.", cfg,
+            fix="Вставить 'exec-timeout <минуты> <секунды>'."))
+
+    for cmd in ("service tcp-keepalives-in", "service tcp-keepalives-out"):
+        lineno = _first_lineno(raw_text, rf"(?m)^{cmd}\\b")
+        if lineno:
+            findings.append(_finding("ok",f"{cmd.replace(' ', '_')}","service", f"{cmd} включена.", cfg,
+                lineno=lineno, rule=cfg["raw_lines"][lineno-1].strip()))
+        else:
+            findings.append(_finding("low",f"{cmd.replace(' ', '_')}_missing","service",
+                f"Не настроена {cmd} — CIS рекомендует включать keepalive для выявления висячих сессий.", cfg,
+                fix=f"Добавить '{cmd}'."))
+
+    if re.search(r"(?m)^banner (motd|login)\b", raw_text):
+        lineno = _first_lineno(raw_text, r"(?m)^banner (motd|login)\b")
+        findings.append(_finding("ok","banner_present","banner",
+            "Баннер предупреждения настроен.", cfg,
+            lineno=lineno, rule=cfg["raw_lines"][lineno-1].strip()))
+    else:
+        findings.append(_finding("low","banner_missing","banner",
+            "Отсутствует предупредительный баннер — требование CIS/NIST.", cfg,
+            fix="Добавить 'banner login' с согласованным текстом."))
 
     # ---------- NAT ----------
     for nat in cfg.get("nat", []):
@@ -461,7 +790,8 @@ def save_html(dev_reports, path="report.html"):
                 rule  = escape(f.get("rule","")) if f.get("rule") else ""
                 snippet = _code_block(f.get("snippet"), f.get("snippet_start"))
                 row_attr = f"data-sev='{sev}' data-text='{escape((where+' '+msg+' '+rule).lower())}'"
-                html.append(f"<tr class='sev-{sev}' {row_attr}><td>{where}</td><td>{msg}{('<br><small class=\"muted\">'+rule+'</small>') if rule else ''}{snippet}</td><td>{fix}</td></tr>")
+                rule_html = f"<br><small class=\"muted\">{rule}</small>" if rule else ""
+                html.append(f"<tr class='sev-{sev}' {row_attr}><td>{where}</td><td>{msg}{rule_html}{snippet}</td><td>{fix}</td></tr>")
             html.append("</tbody></table></details>")
         html.append("</div>")
 
