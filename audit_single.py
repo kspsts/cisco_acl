@@ -119,7 +119,7 @@ def _make_snippet(lines, idx, ctx=2):
     part = lines[start:end]
     return "\n".join(part), start+1  # человекочитаемая нумерация
 
-def parse_config(text: str) -> dict:
+def parse_config(text: str, zones_map: dict | None = None) -> dict:
     raw_lines = text.splitlines()
     cfg = {
         "hostname": None,
@@ -170,9 +170,11 @@ def parse_config(text: str) -> dict:
         nat_role = "inside" if nat_in else ("outside" if nat_out else None)
         ip = f"{ipm.group(1)}/{ipm.group(2)}" if ipm else None
         network = _calc_network(ip) if ip else None
-        zone = _infer_zone(desc.group(1).strip() if desc else "", name, nat_role)
+        zone_override = (zones_map or {}).get(name) if zones_map else None
+        zone = (zone_override or _infer_zone(desc.group(1).strip() if desc else "", name, nat_role))
 
         is_tunnel = name.lower().startswith("tunnel") or bool(re.search(r"^\s*tunnel\s+", body_clean, re.M))
+        is_shutdown = bool(re.search(r"^\s*shutdown\b", body_clean, re.M))
 
         cfg["interfaces"][name] = {
             "description": (desc.group(1).strip() if desc else ""),
@@ -183,6 +185,7 @@ def parse_config(text: str) -> dict:
             "nat_role": nat_role,
             "zone": zone,
             "is_tunnel": is_tunnel,
+            "is_shutdown": is_shutdown,
         }
 
         if acl_in:
@@ -784,6 +787,10 @@ def run_checks(cfg):
 
     # ---------- Интерфейсы ----------
     for ifname, idef in cfg.get("interfaces", {}).items():
+        if idef.get("is_shutdown"):
+            findings.append(_finding("ok","iface_shutdown",f"interface {ifname}",
+                "Интерфейс в shutdown — проверки ACL пропущены.", cfg))
+            continue
         if not idef.get("ip"):
             continue
         has_acl = bool(idef.get("acl_in") or idef.get("acl_out"))
@@ -961,6 +968,26 @@ def run_checks(cfg):
             "Не настроено logging buffered — сложнее проводить расследования.", cfg,
             fix="Добавить 'logging buffered <размер>' и пересмотреть удалённые получатели."))
 
+    ts_lineno = _first_lineno(raw_text, r"(?m)^service timestamps log datetime")
+    if ts_lineno:
+        findings.append(_finding("ok","service_timestamps","logging",
+            "Включены временные метки в логах (service timestamps).", cfg,
+            lineno=ts_lineno, rule=cfg["raw_lines"][ts_lineno-1].strip()))
+    else:
+        findings.append(_finding("low","service_timestamps_missing","logging",
+            "Отсутствуют service timestamps log — сложнее расследовать события.", cfg,
+            fix="Добавить 'service timestamps log datetime msec localtime'."))
+
+    seq_lineno = _first_lineno(raw_text, r"(?m)^service sequence-numbers\b")
+    if seq_lineno:
+        findings.append(_finding("ok","service_sequence_numbers","logging",
+            "Включены sequence-numbers для логов.", cfg,
+            lineno=seq_lineno, rule=cfg["raw_lines"][seq_lineno-1].strip()))
+    else:
+        findings.append(_finding("low","service_sequence_numbers_missing","logging",
+            "Sequence-numbers для syslog не включены.", cfg,
+            fix="Добавить 'service sequence-numbers' для уникальности записей."))
+
     ssh_v2_lineno = _first_lineno(raw_text, r"(?m)^ip ssh version 2\b")
     if ssh_v2_lineno:
         findings.append(_finding("ok","ssh_version2","ssh",
@@ -1020,6 +1047,14 @@ def run_checks(cfg):
             findings.append(_finding("low","nat_overload","ip nat",
                 "NAT overload — стандартно.", cfg, lineno=no, rule=f"ip nat {nat['dir']} source {rule}",
                 fix="Убедиться, что ACL для overload ограничивает приватные сети."))
+            m_acl = re.search(r"\blist\s+(\S+)", rule)
+            if m_acl:
+                acl_name = m_acl.group(1)
+                if acl_name not in cfg.get("acls", {}):
+                    findings.append(_finding("medium","nat_acl_missing","ip nat",
+                        f"NAT overload использует ACL '{acl_name}', но ACL не найден.", cfg,
+                        lineno=no, rule=f"ip nat {nat['dir']} source {rule}",
+                        fix="Создать ACL с приватными сетями для NAT overload или исправить имя."))   
         if re.search(r"\bstatic\b", rule) and re.search(r"\binside\s+source\b", rule):
             findings.append(_finding("medium","static_nat","ip nat",
                 "Static NAT — возможное экспонирование.", cfg, lineno=no, rule=f"ip nat {nat['dir']} source {rule}",
@@ -1221,9 +1256,27 @@ chk.forEach(c=>c.addEventListener('change', applyFilters));
     Path(path).write_text("".join(html), encoding="utf-8")
     return path
 
+def _load_zones_map(path: str | None) -> dict | None:
+    """Читает JSON-файл с сопоставлением интерфейс->зона. Пример: {"Gig0/0":"INET","Vlan10":"LAN"}"""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        print(f"[!] Файл с зонами не найден: {path}", file=sys.stderr)
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            print(f"[!] Ожидается JSON-объект с интерфейсами, получили {type(data)}", file=sys.stderr)
+            return None
+        return {str(k): str(v).upper() for k, v in data.items()}
+    except Exception as exc:
+        print(f"[!] Не удалось прочитать файл зон {path}: {exc}", file=sys.stderr)
+        return None
+
 # ====================== CLI ======================
 
-def audit_folder(folder: str):
+def audit_folder(folder: str, zones_map: dict | None = None):
     out = []
     for f in Path(folder).glob("*.txt"):
         try:
@@ -1243,7 +1296,7 @@ def audit_folder(folder: str):
             continue
 
         try:
-            cfg = parse_config(text)
+            cfg = parse_config(text, zones_map=zones_map)
             findings, cfg = run_checks(cfg)
         except Exception as exc:
             print(f"[!] Ошибка обработки {f.name}: {exc}", file=sys.stderr)
@@ -1272,9 +1325,11 @@ if __name__ == "__main__":
     ap.add_argument("--configs", required=True, help="Папка с .txt конфигами")
     ap.add_argument("--json", default="audit_report.json")
     ap.add_argument("--html", default="report.html")
+    ap.add_argument("--zones", default=None, help="JSON с маппингом интерфейс->зона (перекрывает эвристику)")
     args = ap.parse_args()
 
-    reports = audit_folder(args.configs)
+    zones_map = _load_zones_map(args.zones)
+    reports = audit_folder(args.configs, zones_map=zones_map)
     Path(args.json).write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
     save_html(reports, args.html)
 
