@@ -1136,6 +1136,7 @@ def run_switch_checks(cfg):
         return f
 
     g = cfg.get("global", {})
+    missing_bpduguard = []
 
     # Global hardening
     if g and not g.get("aaa"):
@@ -1172,7 +1173,15 @@ def run_switch_checks(cfg):
             f"VTP режим: {g['vtp_mode']}.", cfg,
             fix="Рекомендуется 'vtp mode transparent' если нет строгой необходимости в VTP."))
 
-    # Interfaces
+    # Interfaces (копим однотипные порты в группы, чтобы не засорять отчёт)
+    missing_portfast = []
+    missing_storm = []
+    bad_dhcp_trust = []
+    bad_dai_trust = []
+    trunk_allowed_all = []
+    trunk_native_default = []
+    trunk_missing_trust = []
+
     for ifname, idef in cfg.get("interfaces", {}).items():
         mode = (idef.get("sw_mode") or "").lower()
         if not mode:
@@ -1180,43 +1189,62 @@ def run_switch_checks(cfg):
         # ACCESS
         if mode == "access":
             if not idef.get("portfast"):
-                f.append(_finding("low","access_no_portfast",f"interface {ifname}",
-                    "Access-порт без spanning-tree portfast.", cfg,
-                    fix="Добавить 'spanning-tree portfast' на edge-портах."))
+                missing_portfast.append(ifname)
             if not idef.get("bpduguard"):
-                f.append(_finding("high","access_no_bpduguard",f"interface {ifname}",
-                    "Access-порт без BPDU Guard.", cfg,
-                    fix="Добавить 'spanning-tree bpduguard enable' на edge-портах."))
+                missing_bpduguard.append(ifname)
             st = idef.get("storm") or {}
             if not any([st.get("broadcast"), st.get("multicast"), st.get("unicast")]):
-                f.append(_finding("medium","access_no_storm_control",f"interface {ifname}",
-                    "Нет storm-control на access-порту.", cfg,
-                    fix="Добавить 'storm-control broadcast/multicast/unicast level <x>' (напр. 1.00)."))
+                missing_storm.append(ifname)
             if idef.get("dhcp_snooping_trust"):
-                f.append(_finding("high","access_dhcp_trust",f"interface {ifname}",
-                    "DHCP Snooping TRUST на access-порту — риск Rogue DHCP.", cfg,
-                    fix="Убрать trust на access-портах; trust только на аплинках к DHCP-серверу."))
+                bad_dhcp_trust.append(ifname)
             if idef.get("arp_inspection_trust"):
-                f.append(_finding("medium","access_dai_trust",f"interface {ifname}",
-                    "ARP Inspection TRUST на access-порту.", cfg,
-                    fix="Trust DAI только на аплинках/серверных портах."))
+                bad_dai_trust.append(ifname)
 
         # TRUNK
         if mode == "trunk":
             allowed = idef.get("trunk_allowed")
             native  = idef.get("trunk_native")
             if not allowed or allowed.strip().lower() in ("all","add all"):
-                f.append(_finding("medium","trunk_allowed_all",f"interface {ifname}",
-                    "Trunk пропускает все VLAN (allowed all).", cfg,
-                    fix="Ограничить 'switchport trunk allowed vlan <список>' только нужными VLAN."))
+                trunk_allowed_all.append(ifname)
             if native is None or native == 1:
-                f.append(_finding("medium","trunk_native_vlan1",f"interface {ifname}",
-                    "Native VLAN = 1 (по умолчанию).", cfg,
-                    fix="Задать нестандартный native VLAN на всех линках и не использовать его в провозимых."))
+                trunk_native_default.append(ifname)
             if not idef.get("dhcp_snooping_trust"):
-                f.append(_finding("low","trunk_dhcp_trust_missing",f"interface {ifname}",
-                    "На trunk часто требуется DHCP Snooping TRUST (uplink).", cfg,
-                    fix="Если это uplink/к DHCP-серверу — добавить 'ip dhcp snooping trust'."))
+                trunk_missing_trust.append(ifname)
+
+    def _summary(sev, ftype, title, ports, fix):
+        sample = ", ".join(sorted(ports[:8]))
+        extra = f", ... (+{len(ports)-8})" if len(ports) > 8 else ""
+        f.append(_finding(sev, ftype, title,
+            f"{title}: {len(ports)} порт(ов): {sample}{extra}", cfg,
+            fix=fix))
+
+    if missing_bpduguard:
+        sample = ", ".join(sorted(missing_bpduguard[:8]))
+        extra = f", ... (+{len(missing_bpduguard)-8})" if len(missing_bpduguard) > 8 else ""
+        f.append(_finding("high","access_no_bpduguard_summary","access ports",
+            f"BPDU Guard отсутствует на {len(missing_bpduguard)} access-порт(ах): {sample}{extra}", cfg,
+            fix="Включить 'spanning-tree bpduguard enable' на edge-портах."))
+    if missing_portfast:
+        _summary("low","access_no_portfast_summary","PortFast не включён на access-портах", missing_portfast,
+                 "Добавить 'spanning-tree portfast' на edge-портах.")
+    if missing_storm:
+        _summary("medium","access_no_storm_control_summary","Нет storm-control на access-портах", missing_storm,
+                 "Добавить 'storm-control broadcast/multicast/unicast level <x>' (например 1.00).")
+    if bad_dhcp_trust:
+        _summary("high","access_dhcp_trust_summary","DHCP Snooping TRUST на access-портах", bad_dhcp_trust,
+                 "Убрать trust на access-портах; trust только на аплинках к DHCP-серверу.")
+    if bad_dai_trust:
+        _summary("medium","access_dai_trust_summary","DAI TRUST на access-портах", bad_dai_trust,
+                 "Trust DAI только на аплинках/серверных портах.")
+    if trunk_allowed_all:
+        _summary("medium","trunk_allowed_all_summary","Trunk пропускает все VLAN (allowed all)", trunk_allowed_all,
+                 "Ограничить 'switchport trunk allowed vlan <список>' только нужными VLAN.")
+    if trunk_native_default:
+        _summary("medium","trunk_native_vlan1_summary","Native VLAN = 1 на trunk", trunk_native_default,
+                 "Задать нестандартный native VLAN на всех линках и не использовать его в провозимых.")
+    if trunk_missing_trust:
+        _summary("low","trunk_dhcp_trust_missing_summary","DHCP Snooping TRUST не задан на trunk", trunk_missing_trust,
+                 "Если это uplink/к DHCP-серверу — добавить 'ip dhcp snooping trust'.")
 
     return f
 
