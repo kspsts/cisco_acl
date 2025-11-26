@@ -411,6 +411,17 @@ def _map_ip_to_zone(ipobj, nets):
 
 _SEVERITY_ORDER = {"high": 3, "medium": 2, "low": 1, "ok": 0}
 
+_RFC1918_RE = re.compile(r"\b(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)")
+
+def _acl_has_rfc1918_deny(items):
+    for it in items:
+        ln = it.get("text","")
+        if not ln.lower().strip().startswith("deny"):
+            continue
+        if _RFC1918_RE.search(ln):
+            return True
+    return False
+
 
 def _find_acl_interfaces(cfg, acl_name):
     usage = cfg.get("acl_usage") or {}
@@ -793,6 +804,11 @@ def run_checks(cfg):
             continue
         if not idef.get("ip"):
             continue
+        if idef.get("nat_role") == "outside" and not idef.get("acl_in"):
+            findings.append(_finding("high","outside_no_ingress_acl",f"interface {ifname}",
+                "Внешний (NAT outside) без входящего ACL.", cfg,
+                fix="Назначить 'ip access-group <ACL> in' и разрешить только нужные протоколы/адреса; в конце 'deny ip any any log'."))
+            continue
         has_acl = bool(idef.get("acl_in") or idef.get("acl_out"))
         if not has_acl:
             if idef.get("is_tunnel"):
@@ -804,6 +820,14 @@ def run_checks(cfg):
 
         findings.append(_finding("ok","iface_acl_present",f"interface {ifname}",
             "На интерфейсе назначен ACL (in/out).", cfg))
+
+        if idef.get("nat_role") == "outside" and idef.get("acl_in"):
+            acl_name = idef.get("acl_in")
+            items = cfg["acls"].get(acl_name, [])
+            if items and not _acl_has_rfc1918_deny(items):
+                findings.append(_finding("medium","outside_no_antispoof",f"interface {ifname}",
+                    f"Ingress ACL {acl_name} на outside не содержит deny RFC1918/приватных источников.", cfg,
+                    fix="Добавить deny для RFC1918/bogon адресов в ingress ACL на внешнем интерфейсе."))
 
     # ---------- SNMP / VTY / HTTP ----------
     for item in cfg["mgmt"].get("snmp", []):
