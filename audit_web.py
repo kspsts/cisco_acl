@@ -145,9 +145,11 @@ def render_html(dev_reports):
 
 def handle_upload(fields, zones_map):
     reports = []
-    items = fields.getlist("configs")
+    raw_items = fields.getlist("configs")
+    # FieldStorage может вернуть bytes при пустых полях — фильтруем только файлы
+    items = [it for it in raw_items if hasattr(it, "file")]
     for item in items:
-        filename = Path(item.filename or "config.txt").name
+        filename = Path(getattr(item, "filename", "") or "config.txt").name
         data = item.file.read()
         text = data.decode("utf-8", errors="ignore")
         try:
