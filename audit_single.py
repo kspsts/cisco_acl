@@ -1280,6 +1280,26 @@ chk.forEach(c=>c.addEventListener('change', applyFilters));
     Path(path).write_text("".join(html), encoding="utf-8")
     return path
 
+def _flatten_findings(dev_reports):
+    """Плоский список findings для CSV/NDJSON."""
+    rows = []
+    for r in dev_reports:
+        host = r.get("hostname")
+        fname = r.get("file")
+        for f in r.get("findings", []):
+            rows.append({
+                "hostname": host,
+                "file": fname,
+                "severity": f.get("sev"),
+                "type": f.get("type"),
+                "where": f.get("where"),
+                "message": f.get("msg"),
+                "rule": f.get("rule"),
+                "fix": f.get("fix"),
+                "lineno": f.get("lineno"),
+            })
+    return rows
+
 def _load_zones_map(path: str | None) -> dict | None:
     """Читает JSON-файл с сопоставлением интерфейс->зона. Пример: {"Gig0/0":"INET","Vlan10":"LAN"}"""
     if not path:
@@ -1349,6 +1369,8 @@ if __name__ == "__main__":
     ap.add_argument("--configs", required=True, help="Папка с .txt конфигами")
     ap.add_argument("--json", default="audit_report.json")
     ap.add_argument("--html", default="report.html")
+    ap.add_argument("--findings-csv", default="findings.csv", help="CSV для плоских findings")
+    ap.add_argument("--findings-ndjson", default=None, help="NDJSON (по строке на finding) для удобной загрузки в БД")
     ap.add_argument("--zones", default=None, help="JSON с маппингом интерфейс->зона (перекрывает эвристику)")
     args = ap.parse_args()
 
@@ -1357,9 +1379,13 @@ if __name__ == "__main__":
     Path(args.json).write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
     save_html(reports, args.html)
 
-    with open("findings.csv","w",newline="",encoding="utf-8") as f:
-        w=csv.writer(f); w.writerow(["hostname","severity","type","where","message","fix","lineno"])
-        for r in reports:
-            for fnd in r["findings"]:
-                w.writerow([r["hostname"], fnd["sev"], fnd.get("type",""), fnd.get("where",""), fnd.get("msg",""), fnd.get("fix",""), fnd.get("lineno","")])
-    print(f"✅ Готово: {args.html}, {args.json}, findings.csv")
+    flat = _flatten_findings(reports)
+    with open(args.findings_csv,"w",newline="",encoding="utf-8") as f:
+        w=csv.writer(f); w.writerow(["hostname","file","severity","type","where","message","rule","fix","lineno"])
+        for row in flat:
+            w.writerow([row["hostname"], row["file"], row["severity"], row["type"], row["where"], row["message"], row["rule"], row["fix"], row["lineno"]])
+    if args.findings_ndjson:
+        with open(args.findings_ndjson,"w",encoding="utf-8") as f:
+            for row in flat:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"✅ Готово: {args.html}, {args.json}, {args.findings_csv}" + (f", {args.findings_ndjson}" if args.findings_ndjson else ""))
