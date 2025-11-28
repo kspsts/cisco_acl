@@ -145,13 +145,25 @@ def render_html(dev_reports):
 
 def handle_upload(fields, zones_map):
     reports = []
-    raw_items = fields.getlist("configs")
-    # FieldStorage может вернуть bytes при пустых полях — фильтруем только файлы
-    items = [it for it in raw_items if hasattr(it, "file")]
-    for item in items:
-        filename = Path(getattr(item, "filename", "") or "config.txt").name
-        data = item.file.read()
-        text = data.decode("utf-8", errors="ignore")
+    raw_items = fields.getlist("configs") or []
+    if not isinstance(raw_items, list):
+        raw_items = [raw_items]
+
+    if not raw_items:
+        print("[!] POST без файлов configs", file=sys.stderr)
+
+    for idx, item in enumerate(raw_items, 1):
+        data, filename = None, None
+        if hasattr(item, "file") and item.file:
+            data = item.file.read()
+            filename = Path(getattr(item, "filename", "") or f"config_{idx}.txt").name
+        elif isinstance(item, bytes):
+            data = item
+            filename = f"config_{idx}.txt"
+        else:
+            continue
+
+        text = (data or b"").decode("utf-8", errors="ignore")
         try:
             cfg = parse_config(text, zones_map=zones_map)
             findings, cfg = run_checks(cfg)
