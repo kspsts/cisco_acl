@@ -53,27 +53,45 @@ function copyNextCode(btn){
 }
 const q = document.getElementById('q');
 const chk = document.querySelectorAll('.filt');
+const hostSel = document.getElementById('host-filter');
+const typeSel = document.getElementById('type-filter');
 function applyFilters(){
   const query = (q.value||'').toLowerCase();
   const on = new Set(Array.from(chk).filter(c=>c.checked).map(c=>c.value));
+  const host = hostSel ? hostSel.value : '';
+  const ftype = typeSel ? typeSel.value : '';
   document.querySelectorAll('tr[class^="sev-"]').forEach(tr=>{
     const sev = tr.className.replace('sev-','').trim();
     const txt = tr.getAttribute('data-text')||'';
+    const hst = tr.getAttribute('data-host')||'';
+    const typ = tr.getAttribute('data-type')||'';
     const okSev = on.has(sev);
     const okTxt = !query || txt.includes(query);
-    tr.style.display = (okSev && okTxt) ? '' : 'none';
+    const okHost = !host || hst === host;
+    const okType = !ftype || typ === ftype;
+    tr.style.display = (okSev && okTxt && okHost && okType) ? '' : 'none';
   });
 }
 if (q) q.addEventListener('input', applyFilters);
 chk.forEach(c=>c.addEventListener('change', applyFilters));
+if (hostSel) hostSel.addEventListener('change', applyFilters);
+if (typeSel) typeSel.addEventListener('change', applyFilters);
 </script>
 """
 
 def render_html(dev_reports):
     totals = {"high":0,"medium":0,"low":0,"ok":0}
+    hosts = []
+    types = {}
     for r in dev_reports:
+        h = (r.get("hostname") or r.get("file") or "unknown")
+        hosts.append(h)
         for f in r.get("findings", []):
             totals[f["sev"]] = totals.get(f["sev"], 0) + 1
+            t = f.get("type") or "unknown"
+            types[t] = types.get(t, 0) + 1
+    host_opts = "".join(f"<option value='{html.escape(h)}'>{html.escape(h)}</option>" for h in sorted(set(hosts)))
+    type_opts = "".join(f"<option value='{html.escape(t)}'>{html.escape(t)} ({cnt})</option>" for t,cnt in sorted(types.items(), key=lambda x:(-x[1], x[0])))
 
     parts = [HTML_HEAD]
     parts.append("""
@@ -85,13 +103,25 @@ def render_html(dev_reports):
     <span class='chip'>LOW: %d</span>
     <span class='chip'>OK: %d</span>
     <input id="q" type="search" placeholder="Поиск по сообщениям/правилам/интерфейсам…">
+    <label>Устройство:
+      <select id="host-filter">
+        <option value="">Все</option>
+        %s
+      </select>
+    </label>
+    <label>Тип:
+      <select id="type-filter">
+        <option value="">Все</option>
+        %s
+      </select>
+    </label>
     <label><input type="checkbox" class="filt" value="high" checked> HIGH</label>
     <label><input type="checkbox" class="filt" value="medium" checked> MEDIUM</label>
     <label><input type="checkbox" class="filt" value="low" checked> LOW</label>
     <label><input type="checkbox" class="filt" value="ok" checked> OK</label>
   </div>
 </div>
-""" % (totals.get("high",0), totals.get("medium",0), totals.get("low",0), totals.get("ok",0)))
+""" % (totals.get("high",0), totals.get("medium",0), totals.get("low",0), totals.get("ok",0), host_opts, type_opts))
 
     parts.append("""
 <div class="card upload">
@@ -133,7 +163,7 @@ def render_html(dev_reports):
                     fix   = html.escape(f.get("fix","")) if f.get("fix") else "—"
                     rule  = html.escape(f.get("rule","")) if f.get("rule") else ""
                     snippet = _code_block(f.get("snippet"), f.get("snippet_start"))
-                    row_attr = f"data-sev='{sev}' data-text='{html.escape((where+' '+msg+' '+rule).lower())}'"
+                    row_attr = f"data-sev='{sev}' data-type='{html.escape(f.get('type',''))}' data-text='{html.escape((where+' '+msg+' '+rule).lower())}' data-host='{host}'"
                     rule_html = f"<br><small class=\"muted\">{rule}</small>" if rule else ""
                     parts.append(f"<tr class='sev-{sev}' {row_attr}><td>{where}</td><td>{msg}{rule_html}{snippet}</td><td>{fix}</td></tr>")
                 parts.append("</tbody></table></details>")
