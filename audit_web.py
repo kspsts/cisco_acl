@@ -208,7 +208,11 @@ CREATE TABLE IF NOT EXISTS {table} (
             with conn.cursor() as cur:
                 cur.execute(create_sql)
                 cur.execute(f"TRUNCATE {table}")
-                cur.copy_expert(f"COPY {table} (hostname,file,severity,type,\"where\",message,rule,fix,lineno) FROM STDIN WITH CSV HEADER", buf)
+                copy_sql = f"COPY {table} (hostname,file,severity,type,\"where\",message,rule,fix,lineno) FROM STDIN WITH CSV HEADER"
+                if hasattr(cur, "copy"):
+                    cur.copy(copy_sql, buf)
+                else:
+                    cur.copy_expert(copy_sql, buf)
             conn.commit()
         return True
     except Exception as exc:
