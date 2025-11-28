@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, cgi, io, json, html
+import argparse, cgi, io, json, html, os, sys
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -173,8 +173,51 @@ def handle_upload(fields, zones_map):
     return reports
 
 
+def _load_to_postgres(dsn: str, table: str, rows: list[dict]) -> bool:
+    try:
+        import psycopg
+    except Exception as exc:
+        print(f"[!] psycopg не установлен, пропускаю загрузку в PG: {exc}", file=sys.stderr)
+        return False
+
+    create_sql = f"""
+CREATE TABLE IF NOT EXISTS {table} (
+  hostname text,
+  file text,
+  severity text,
+  type text,
+  "where" text,
+  message text,
+  rule text,
+  fix text,
+  lineno int
+);
+"""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["hostname","file","severity","type","where","message","rule","fix","lineno"])
+    for r in rows:
+        w.writerow([r.get("hostname"), r.get("file"), r.get("severity"), r.get("type"),
+                    r.get("where"), r.get("message"), r.get("rule"), r.get("fix"), r.get("lineno")])
+    buf.seek(0)
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(create_sql)
+                cur.execute(f"TRUNCATE {table}")
+                cur.copy_expert(f"COPY {table} (hostname,file,severity,type,\"where\",message,rule,fix,lineno) FROM STDIN WITH CSV HEADER", buf)
+            conn.commit()
+        return True
+    except Exception as exc:
+        print(f"[!] Ошибка загрузки в PostgreSQL: {exc}", file=sys.stderr)
+        return False
+
+
 class UploadHandler(BaseHTTPRequestHandler):
     zones_map = None
+    pg_dsn = None
+    pg_table = "audit_findings"
     last_reports = []
 
     def _send_html(self, content):
@@ -203,6 +246,9 @@ class UploadHandler(BaseHTTPRequestHandler):
             return
         reports = handle_upload(form, self.zones_map)
         self.last_reports = reports
+        if self.pg_dsn:
+            flat = _flatten_findings(reports)
+            _load_to_postgres(self.pg_dsn, self.pg_table, flat)
         page = render_html(reports)
         self._send_html(page)
 
@@ -211,14 +257,23 @@ def main():
     ap = argparse.ArgumentParser(description="Cisco GW Audit web UI")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--zones", default=None, help="JSON с маппингом интерфейс->зона")
+    ap.add_argument("--pg-dsn", dest="pg_dsn", default=None, help="DSN PostgreSQL для загрузки (опционально, можно через env PG_DSN/DATABASE_URL)")
+    ap.add_argument("--pg-dns", dest="pg_dsn", default=None, help="Опечаточный алиас для --pg-dsn")
+    ap.add_argument("--pg-table", default="audit_findings", help="Имя таблицы для загрузки в PG")
     args = ap.parse_args()
 
     zones_map = _load_zones_map(args.zones)
+    pg_dsn = args.pg_dsn or os.getenv("PG_DSN") or os.getenv("DATABASE_URL")
+
     handler = UploadHandler
     handler.zones_map = zones_map
+    handler.pg_dsn = pg_dsn
+    handler.pg_table = args.pg_table
 
     server = HTTPServer(("0.0.0.0", args.port), handler)
     print(f"[*] Откройте http://localhost:{args.port} и загрузите конфиги (.txt)")
+    if pg_dsn:
+        print(f"[*] Результаты будут грузиться в PostgreSQL ({args.pg_table})")
     server.serve_forever()
 
 

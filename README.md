@@ -24,9 +24,11 @@ python3 audit_pipeline.py \
 ## Веб-форма
 Запуск простого веб-интерфейса для загрузки конфигов:
 ```bash
-python3 audit_web.py --port 8000 --zones zones.json
+python3 audit_web.py --port 8000 --zones zones.json \
+  --pg-dsn "$PG_DSN" --pg-table audit_findings   # опционально грузить в PG
 # открыть http://localhost:8000
 ```
+Web сохраняет отчёт в памяти для просмотра и, если задан DSN (или env PG_DSN/DATABASE_URL), загружает findings в PostgreSQL (таблица создаётся/трункетится).
 
 ## PostgreSQL (локально)
 ```bash
