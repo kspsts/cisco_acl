@@ -28,7 +28,7 @@ python3 audit_web.py --port 8000 --zones zones.json \
   --pg-dsn "$PG_DSN" --pg-table audit_findings   # опционально грузить в PG
 # открыть http://localhost:8000
 ```
-Web сохраняет отчёт в памяти для просмотра и, если задан DSN (или env PG_DSN/DATABASE_URL), загружает findings в PostgreSQL (таблица создаётся/трункетится).
+Web работает на 0.0.0.0:PORT, хранит отчёт в памяти текущего процесса и, если задан DSN (или env PG_DSN/DATABASE_URL), пишет findings в PostgreSQL (таблица создаётся/трункетится). При старте, если в памяти отчёта нет и задан DSN, web поднимет данные из таблицы (без сниппетов/матрицы).
 
 ## PostgreSQL (локально)
 ```bash
@@ -36,7 +36,7 @@ docker compose up -d postgres
 export PG_DSN=postgresql://audit:audit@localhost:5432/audit
 python3 audit_pipeline.py --configs ./configs --out-dir ./out --pg-dsn "$PG_DSN"
 ```
-Таблица `audit_findings` создаётся автоматически, загрузка через COPY (по умолчанию truncate+replace).
+Таблица создаётся автоматически, загрузка через COPY, режим truncate+replace (каждый прогон перезаписывает результаты).
 
 ## Структура данных
 - `audit_report.json` — полный отчёт по устройствам.
