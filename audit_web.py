@@ -55,7 +55,6 @@ const q = document.getElementById('q');
 const chk = document.querySelectorAll('.filt');
 const hostSel = document.getElementById('host-filter');
 const typeSel = document.getElementById('type-filter');
-const sevBtns = document.querySelectorAll('.sev-btn');
 function applyFilters(){
   const query = (q.value||'').toLowerCase();
   const on = new Set(Array.from(chk).filter(c=>c.checked).map(c=>c.value));
@@ -84,19 +83,6 @@ if (q) q.addEventListener('input', applyFilters);
 chk.forEach(c=>c.addEventListener('change', applyFilters));
 if (hostSel) hostSel.addEventListener('change', applyFilters);
 if (typeSel) typeSel.addEventListener('change', applyFilters);
-sevBtns.forEach(btn=>{
-  btn.addEventListener('click', ()=>{
-    const mode = btn.dataset.mode;
-    const map = {
-      crit: ["high"],
-      warn: ["high","medium"],
-      all:  ["high","medium","low","ok"]
-    };
-    const on = map[mode] || map.all;
-    chk.forEach(c=>{ c.checked = on.includes(c.value); });
-    applyFilters();
-  });
-});
 </script>
 """
 
@@ -110,9 +96,17 @@ def render_html(dev_reports):
         for f in r.get("findings", []):
             totals[f["sev"]] = totals.get(f["sev"], 0) + 1
             t = f.get("type") or "unknown"
-            types[t] = types.get(t, 0) + 1
+            cat = (t.split("_", 1)[0] if "_" in t else t)
+            types.setdefault(cat, {})
+            types[cat][t] = types[cat].get(t, 0) + 1
     host_opts = "".join(f"<option value='{html.escape(h)}'>{html.escape(h)}</option>" for h in sorted(set(hosts)))
-    type_opts = "".join(f"<option value='{html.escape(t)}'>{html.escape(t)} ({cnt})</option>" for t,cnt in sorted(types.items(), key=lambda x:(-x[1], x[0])))
+    type_opts_parts = []
+    for cat in sorted(types.keys()):
+        type_opts_parts.append(f"<optgroup label='{html.escape(cat)}'>")
+        for t,cnt in sorted(types[cat].items(), key=lambda x:(-x[1], x[0])):
+            type_opts_parts.append(f"<option value='{html.escape(t)}'>{html.escape(t)} ({cnt})</option>")
+        type_opts_parts.append("</optgroup>")
+    type_opts = "".join(type_opts_parts)
 
     parts = [HTML_HEAD]
     parts.append("""
@@ -140,11 +134,6 @@ def render_html(dev_reports):
     <label><input type="checkbox" class="filt" value="medium" checked> MEDIUM</label>
     <label><input type="checkbox" class="filt" value="low" checked> LOW</label>
     <label><input type="checkbox" class="filt" value="ok" checked> OK</label>
-    <div>
-      <button type="button" class="sev-btn" data-mode="crit">Только HIGH</button>
-      <button type="button" class="sev-btn" data-mode="warn">HIGH+MED</button>
-      <button type="button" class="sev-btn" data-mode="all">Все</button>
-    </div>
   </div>
 </div>
 """ % (totals.get("high",0), totals.get("medium",0), totals.get("low",0), totals.get("ok",0), host_opts, type_opts))
