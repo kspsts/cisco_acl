@@ -256,6 +256,8 @@ def _load_to_postgres(dsn: str, table: str, rows: list[dict]) -> bool:
         print(f"[!] psycopg не установлен, пропускаю загрузку в PG: {exc}", file=sys.stderr)
         return False
 
+    print(f"[*] Пишу в PostgreSQL {len(rows)} записей в таблицу {table}")
+
     create_sql = f"""
 CREATE TABLE IF NOT EXISTS {table} (
   hostname text,
@@ -288,6 +290,7 @@ CREATE TABLE IF NOT EXISTS {table} (
                 else:
                     cur.copy_expert(copy_sql, buf)
             conn.commit()
+        print("[*] Загрузка в PostgreSQL завершена")
         return True
     except Exception as exc:
         print(f"[!] Ошибка загрузки в PostgreSQL: {exc}", file=sys.stderr)
