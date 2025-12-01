@@ -285,9 +285,9 @@ CREATE TABLE IF NOT EXISTS {table} (
                 cur.execute(create_sql)
                 cur.execute(f"TRUNCATE {table}")
                 copy_sql = f"COPY {table} (hostname,file,severity,type,\"where\",message,rule,fix,lineno) FROM STDIN WITH CSV HEADER"
-                if hasattr(cur, "copy"):
-                    cur.copy(copy_sql, source=buf)
-                else:
+                try:
+                    cur.copy(copy_sql, buf)
+                except TypeError:
                     cur.copy_expert(copy_sql, buf)
             conn.commit()
         print("[*] Загрузка в PostgreSQL завершена")
