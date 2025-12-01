@@ -60,6 +60,19 @@ function applyFilters(){
   const on = new Set(Array.from(chk).filter(c=>c.checked).map(c=>c.value));
   const host = hostSel ? hostSel.value : '';
   const ftype = typeSel ? typeSel.value : '';
+  // обновляем список типов под выбранные severity
+  if (typeSel){
+    const selectedSev = new Set(on);
+    Array.from(typeSel.options).forEach(opt=>{
+      const sevAttr = opt.getAttribute('data-sev')||'';
+      const sevSet = new Set(sevAttr.split(',').filter(Boolean));
+      const intersect = Array.from(sevSet).some(s=>selectedSev.has(s));
+      opt.disabled = (opt.value !== '' && !intersect);
+      if (opt.disabled && opt.selected){
+        opt.selected = false;
+      }
+    });
+  }
   document.querySelectorAll('tr[class^="sev-"]').forEach(tr=>{
     const sev = tr.className.replace('sev-','').trim();
     const txt = tr.getAttribute('data-text')||'';
@@ -98,13 +111,17 @@ def render_html(dev_reports):
             t = f.get("type") or "unknown"
             cat = (t.split("_", 1)[0] if "_" in t else t)
             types.setdefault(cat, {})
-            types[cat][t] = types[cat].get(t, 0) + 1
+            entry = types[cat].get(t, {"count":0,"sevs":set()})
+            entry["count"] += 1
+            entry["sevs"].add(f.get("sev") or "unknown")
+            types[cat][t] = entry
     host_opts = "".join(f"<option value='{html.escape(h)}'>{html.escape(h)}</option>" for h in sorted(set(hosts)))
     type_opts_parts = []
     for cat in sorted(types.keys()):
         type_opts_parts.append(f"<optgroup label='{html.escape(cat)}'>")
-        for t,cnt in sorted(types[cat].items(), key=lambda x:(-x[1], x[0])):
-            type_opts_parts.append(f"<option value='{html.escape(t)}'>{html.escape(t)} ({cnt})</option>")
+        for t,meta in sorted(types[cat].items(), key=lambda x:(-x[1]["count"], x[0])):
+            sev_list = ",".join(sorted(meta["sevs"]))
+            type_opts_parts.append(f"<option value='{html.escape(t)}' data-sev='{html.escape(sev_list)}'>{html.escape(t)} ({meta['count']})</option>")
         type_opts_parts.append("</optgroup>")
     type_opts = "".join(type_opts_parts)
 
