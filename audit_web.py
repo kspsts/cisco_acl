@@ -55,6 +55,7 @@ const q = document.getElementById('q');
 const chk = document.querySelectorAll('.filt');
 const hostSel = document.getElementById('host-filter');
 const typeSel = document.getElementById('type-filter');
+const sevBtns = document.querySelectorAll('.sev-btn');
 function applyFilters(){
   const query = (q.value||'').toLowerCase();
   const on = new Set(Array.from(chk).filter(c=>c.checked).map(c=>c.value));
@@ -71,11 +72,31 @@ function applyFilters(){
     const okType = !ftype || typ === ftype;
     tr.style.display = (okSev && okTxt && okHost && okType) ? '' : 'none';
   });
+  // скрывать карточки устройств без видимых строк
+  document.querySelectorAll('.device-card').forEach(card=>{
+    const h = card.dataset.host || '';
+    const rows = card.querySelectorAll(`tr[data-host="${h}"]`);
+    const anyVisible = Array.from(rows).some(r=>r.style.display !== 'none');
+    card.style.display = anyVisible ? '' : 'none';
+  });
 }
 if (q) q.addEventListener('input', applyFilters);
 chk.forEach(c=>c.addEventListener('change', applyFilters));
 if (hostSel) hostSel.addEventListener('change', applyFilters);
 if (typeSel) typeSel.addEventListener('change', applyFilters);
+sevBtns.forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    const mode = btn.dataset.mode;
+    const map = {
+      crit: ["high"],
+      warn: ["high","medium"],
+      all:  ["high","medium","low","ok"]
+    };
+    const on = map[mode] || map.all;
+    chk.forEach(c=>{ c.checked = on.includes(c.value); });
+    applyFilters();
+  });
+});
 </script>
 """
 
@@ -119,6 +140,11 @@ def render_html(dev_reports):
     <label><input type="checkbox" class="filt" value="medium" checked> MEDIUM</label>
     <label><input type="checkbox" class="filt" value="low" checked> LOW</label>
     <label><input type="checkbox" class="filt" value="ok" checked> OK</label>
+    <div>
+      <button type="button" class="sev-btn" data-mode="crit">Только HIGH</button>
+      <button type="button" class="sev-btn" data-mode="warn">HIGH+MED</button>
+      <button type="button" class="sev-btn" data-mode="all">Все</button>
+    </div>
   </div>
 </div>
 """ % (totals.get("high",0), totals.get("medium",0), totals.get("low",0), totals.get("ok",0), host_opts, type_opts))
@@ -144,7 +170,7 @@ def render_html(dev_reports):
 
         for r in dev_reports:
             host = (r.get("hostname") or r.get("file") or "unknown")
-            parts.append(f"<div class='card' id='{host}'><h3>{host}</h3>")
+            parts.append(f"<div class='card device-card' data-host='{host}' id='{host}'><h3>{host}</h3>")
             iz = r.get("_interzone", [])
             if iz:
                 parts.append("<b>Матрица межзоновых разрешений</b>")
