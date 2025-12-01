@@ -329,6 +329,22 @@ def _read_from_postgres(dsn: str, table: str):
     return list(devices.values())
 
 
+def _test_pg_connection(dsn: str) -> bool:
+    try:
+        import psycopg
+    except Exception as exc:
+        print(f"[!] psycopg не установлен, пропускаю чтение из PG: {exc}", file=sys.stderr)
+        return False
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True
+    except Exception as exc:
+        print(f"[!] Не удалось подключиться к PostgreSQL: {exc}", file=sys.stderr)
+        return False
+
+
 class UploadHandler(BaseHTTPRequestHandler):
     zones_map = None
     pg_dsn = None
@@ -386,13 +402,15 @@ def main():
 
     handler = UploadHandler
     handler.zones_map = zones_map
-    handler.pg_dsn = pg_dsn
+    handler.pg_dsn = pg_dsn if pg_dsn and _test_pg_connection(pg_dsn) else None
     handler.pg_table = args.pg_table
 
     server = HTTPServer(("0.0.0.0", args.port), handler)
     print(f"[*] Откройте http://localhost:{args.port} и загрузите конфиги (.txt)")
-    if pg_dsn:
+    if handler.pg_dsn:
         print(f"[*] Результаты будут грузиться в PostgreSQL ({args.pg_table})")
+    elif pg_dsn:
+        print("[!] Подключение к PostgreSQL не установлено, работа только в памяти/браузере.", file=sys.stderr)
     server.serve_forever()
 
 

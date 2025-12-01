@@ -11,6 +11,21 @@ from pathlib import Path
 from audit_single import audit_folder, save_html, _flatten_findings, _load_zones_map
 
 
+def _test_pg_connection(dsn: str) -> bool:
+    try:
+        import psycopg
+    except Exception as exc:
+        print(f"[!] psycopg не установлен, пропускаю загрузку в PG: {exc}", file=sys.stderr)
+        return False
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True
+    except Exception as exc:
+        print(f"[!] Не удалось подключиться к PostgreSQL: {exc}", file=sys.stderr)
+        return False
+
 def _load_to_postgres(dsn: str, table: str, rows: list[dict]) -> bool:
     try:
         import psycopg
@@ -93,11 +108,14 @@ def main():
 
     pg_dsn = args.pg_dsn or os.getenv("PG_DSN") or os.getenv("DATABASE_URL")
     if pg_dsn:
-        ok = _load_to_postgres(pg_dsn, args.pg_table, flat)
-        if ok:
-            print(f"✅ Загрузка в PostgreSQL ({args.pg_table}) завершена")
+        if _test_pg_connection(pg_dsn):
+            ok = _load_to_postgres(pg_dsn, args.pg_table, flat)
+            if ok:
+                print(f"✅ Загрузка в PostgreSQL ({args.pg_table}) завершена")
+            else:
+                print("⚠️  Загрузка в PostgreSQL пропущена или завершилась ошибкой", file=sys.stderr)
         else:
-            print("⚠️  Загрузка в PostgreSQL пропущена или завершилась ошибкой", file=sys.stderr)
+            print("⚠️  Подключение к PostgreSQL недоступно, пропускаю загрузку.", file=sys.stderr)
 
     print(f"✅ Готово: {html_path}, {json_path}, {csv_path}, {ndjson_path}")
 
