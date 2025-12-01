@@ -848,20 +848,6 @@ def run_checks(cfg):
         findings.append(_finding("ok","iface_acl_present",f"interface {ifname}",
             "На интерфейсе назначен ACL (in/out).", cfg))
 
-        if not idef.get("ip"):
-            continue
-        has_acl = bool(idef.get("acl_in") or idef.get("acl_out"))
-        if not has_acl:
-            if idef.get("is_tunnel"):
-                continue
-            findings.append(_finding("medium","iface_no_acl",f"interface {ifname}",
-                "IP-интерфейс без ip access-group (нет фильтрации).",
-                cfg, fix="Назначить ACL in/out либо использовать Zone-Based Firewall с policy-map."))
-            continue
-
-        findings.append(_finding("ok","iface_acl_present",f"interface {ifname}",
-            "На интерфейсе назначен ACL (in/out).", cfg))
-
     # ---------- SNMP / VTY / HTTP ----------
     for item in cfg["mgmt"].get("snmp", []):
         comm = item["community"]; no = item["lineno"]
@@ -1214,8 +1200,10 @@ def run_switch_checks(cfg):
     def _summary(sev, ftype, title, ports, fix):
         sample = ", ".join(sorted(ports[:8]))
         extra = f", ... (+{len(ports)-8})" if len(ports) > 8 else ""
+        samples_rule = ", ".join(sorted(ports[:3]))  # показать пару портов для наглядности
         f.append(_finding(sev, ftype, title,
             f"{title}: {len(ports)} порт(ов): {sample}{extra}", cfg,
+            rule=samples_rule or None,
             fix=fix))
 
     if missing_bpduguard:
