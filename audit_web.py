@@ -294,6 +294,41 @@ CREATE TABLE IF NOT EXISTS {table} (
         return False
 
 
+def _read_from_postgres(dsn: str, table: str):
+    """Читает таблицу findings и формирует dev_reports (без interzone/object_groups)."""
+    try:
+        import psycopg
+    except Exception as exc:
+        print(f"[!] psycopg не установлен, не могу читать из PG: {exc}", file=sys.stderr)
+        return []
+    sql = f"SELECT hostname, file, severity, type, \"where\", message, rule, fix, lineno FROM {table}"
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+    except Exception as exc:
+        print(f"[!] Ошибка чтения из PostgreSQL: {exc}", file=sys.stderr)
+        return []
+
+    devices = {}
+    for host, fname, sev, tp, wh, msg, rule, fix, lineno in rows:
+        h = host or fname or "unknown"
+        devices.setdefault(h, {"file": fname, "hostname": host, "findings": [], "_interzone": [], "_object_groups": {}})
+        devices[h]["findings"].append({
+            "sev": sev or "ok",
+            "type": tp or "",
+            "where": wh or "",
+            "msg": msg or "",
+            "rule": rule,
+            "fix": fix,
+            "lineno": lineno,
+            "snippet": None,
+            "snippet_start": None,
+        })
+    return list(devices.values())
+
+
 class UploadHandler(BaseHTTPRequestHandler):
     zones_map = None
     pg_dsn = None
@@ -309,6 +344,10 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if not self.last_reports and self.pg_dsn:
+            cached = _read_from_postgres(self.pg_dsn, self.pg_table)
+            if cached:
+                self.last_reports = cached
         page = render_html(self.last_reports)
         self._send_html(page)
 
