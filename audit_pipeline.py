@@ -33,6 +33,8 @@ def _load_to_postgres(dsn: str, table: str, rows: list[dict]) -> bool:
         print(f"[!] psycopg не установлен, пропускаю загрузку в PG: {exc}", file=sys.stderr)
         return False
 
+    print(f"[*] Пишу в PostgreSQL {len(rows)} записей в таблицу {table}")
+
     create_sql = f"""
 CREATE TABLE IF NOT EXISTS {table} (
   hostname text,
@@ -54,18 +56,24 @@ CREATE TABLE IF NOT EXISTS {table} (
                     r.get("where"), r.get("message"), r.get("rule"), r.get("fix"), r.get("lineno")])
     buf.seek(0)
 
+    def _copy(cur, sql, buf_obj):
+        try:
+            with cur.copy(sql) as cp:
+                cp.write(buf_obj.getvalue())
+            return
+        except Exception:
+            pass
+        cur.copy_expert(sql, buf_obj)
+
     try:
         with psycopg.connect(dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(create_sql)
                 cur.execute(f"TRUNCATE {table}")  # простой вариант: полная замена
                 copy_sql = f"COPY {table} (hostname,file,severity,type,\"where\",message,rule,fix,lineno) FROM STDIN WITH CSV HEADER"
-                # psycopg3: используем copy() если нет параметра source (binary build), иначе copy_expert
-                try:
-                    cur.copy(copy_sql, buf)
-                except TypeError:
-                    cur.copy_expert(copy_sql, buf)
+                _copy(cur, copy_sql, buf)
             conn.commit()
+        print("[*] Загрузка в PostgreSQL завершена")
         return True
     except Exception as exc:
         print(f"[!] Ошибка загрузки в PostgreSQL: {exc}", file=sys.stderr)

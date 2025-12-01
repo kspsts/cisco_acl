@@ -279,16 +279,22 @@ CREATE TABLE IF NOT EXISTS {table} (
                     r.get("where"), r.get("message"), r.get("rule"), r.get("fix"), r.get("lineno")])
     buf.seek(0)
 
+    def _copy(cur, sql, buf_obj):
+        try:
+            with cur.copy(sql) as cp:
+                cp.write(buf_obj.getvalue())
+            return
+        except Exception:
+            pass
+        cur.copy_expert(sql, buf_obj)
+
     try:
         with psycopg.connect(dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(create_sql)
                 cur.execute(f"TRUNCATE {table}")
                 copy_sql = f"COPY {table} (hostname,file,severity,type,\"where\",message,rule,fix,lineno) FROM STDIN WITH CSV HEADER"
-                try:
-                    cur.copy(copy_sql, buf)
-                except TypeError:
-                    cur.copy_expert(copy_sql, buf)
+                _copy(cur, copy_sql, buf)
             conn.commit()
         print("[*] Загрузка в PostgreSQL завершена")
         return True
